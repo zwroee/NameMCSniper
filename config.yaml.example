@@ -1,0 +1,75 @@
+# NameMC Sniper Configuration File
+# Copy this file to config.yaml and edit with your settings
+
+proxy:
+  # Enable proxy support for requests
+  enabled: false
+  
+  # Your proxy list (formatted as http://username:password@ip:port)
+  proxies:
+    - "http://username:password@proxy1.example.com:8080"
+    - "http://username:password@proxy2.example.com:8080"
+    # Add more proxies here
+  
+  # Enable proxy rotation (round-robin)
+  rotation_enabled: true
+  
+  # Proxy timeout in seconds
+  timeout: 10
+  
+  # Maximum retries for failed proxies
+  max_retries: 3
+
+discord:
+  # Enable Discord notifications
+  enabled: false
+  
+  # Discord webhook URL
+  webhook_url: "https://discord.com/api/webhooks/YOUR_WEBHOOK_ID/YOUR_WEBHOOK_TOKEN"
+  
+  # Role ID to mention in notifications (optional)
+  mention_role_id: ""
+  
+  # Embed color (decimal format, default is green)
+  embed_color: 65280
+
+snipe:
+  # Target username to snipe
+  target_username: "DesiredUsername"
+  
+  # Minecraft bearer token for authentication
+  bearer_token: "your_minecraft_bearer_token_here"
+  
+  # Start sniping X seconds before the drop time
+  start_sniping_at_seconds: 30
+  
+  # Maximum number of snipe attempts
+  max_snipe_attempts: 100
+  
+  # Delay between requests in milliseconds
+  request_delay_ms: 25
+  
+  # Number of concurrent sniping requests
+  concurrent_requests: 10
+  
+  # Use multiple threads for sniping
+  use_multiple_threads: true
+
+notifications:
+  # Notification intervals in seconds before drop
+  intervals:
+    - 86400  # 24 hours
+    - 43200  # 12 hours
+    - 21600  # 6 hours
+    - 7200   # 2 hours
+    - 3600   # 1 hour
+    - 1800   # 30 minutes
+    - 300    # 5 minutes
+    - 60     # 1 minute
+    - 30     # 30 seconds
+
+# Enable debug mode for verbose logging
+debug_mode: false
+
+# Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+log_level: "INFO"
