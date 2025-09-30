@@ -175,6 +175,7 @@ The interactive menu features a professional Matrix-style interface with:
 - **Real-time Information** - Current time display and status updates
 - **User-friendly Navigation** - Simple number-based option selection
 - **Professional Styling** - Consistent green theme throughout
+<img width="1918" height="983" alt="Screenshot 2025-09-30 063615" src="https://github.com/user-attachments/assets/387111dd-6039-46c1-b04c-73687cbb761a" />
 
 ### Command Line Interface
 
