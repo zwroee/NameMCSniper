@@ -2,7 +2,7 @@
 
 <div align="center">
 
-![NameMC Sniper Logo](https://img.shields.io/badge/NameMC-Sniper-blue?style=for-the-badge&logo=minecraft)
+<img width="1536" height="324" alt="assets_task_01k6cfgfnce75rr55xznbme123_1759208092_img_1" src="https://github.com/user-attachments/assets/cf0a9ba6-a318-424b-a163-82f34b9915b0" />
 
 **A professional-grade Minecraft username sniper with advanced features**
 
@@ -10,7 +10,7 @@
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Code Style](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
 
-[📚 Documentation](https://your-docs-website.com) • [🚀 Quick Start](#quick-start) • [⚙️ Configuration](#configuration) • [🤝 Support](#support)
+[📚 Documentation](https://zwroee.github.io/NameMCSniper-Docs/) • [🚀 Quick Start](https://zwroee.github.io/NameMCSniper-Docs/#quick-start) • [⚙️ Configuration](https://zwroee.github.io/NameMCSniper-Docs/getting-started/configuration/) • [🤝 Support](https://zwroee.github.io/NameMCSniper-Docs/legal/support/)
 
 </div>
 
@@ -361,7 +361,7 @@ grep -i "claim attempt" logs/namemc_sniper_*.log
 
 For comprehensive documentation, examples, and advanced configuration:
 
-**[📖 Visit our Documentation Website](https://your-docs-website.com)**
+**[📖 Visit our Documentation Website](https://zwroee.github.io/NameMCSniper-Docs/)**
 
 - 🎯 **Sniping Strategies** - Optimal settings for different scenarios
 - 🔧 **API Reference** - Complete function and class documentation  
@@ -369,33 +369,12 @@ For comprehensive documentation, examples, and advanced configuration:
 - 🤖 **Bot Integration** - Discord bot setup and commands
 - 📈 **Analytics** - Success rate tracking and statistics
 
-## 👥 Contributors
+##🫂Authors
 
-Special thanks to everyone who contributed to this project:
+### Authors
+- **[zwroe]** -  [@zwroee](https://github.com/zwroee)
+- **[light]** - [@zerolight18](https://github.com/zerolight18)
 
-### Core Contributors
-- **[Your Name]** - *Project Lead & Main Developer* - [@your-github](https://github.com/your-username)
-- **[Collaborator Name]** - *Architecture & Performance Optimization* - Contributed via pair programming sessions
-
-### How to Contribute
-
-We welcome contributions! Please see our [Contributing Guide](CONTRIBUTING.md) for details.
-
-#### Development Setup
-```bash
-# Clone and setup development environment
-git clone https://github.com/your-username/NameMcSniper.git
-cd NameMcSniper
-
-# Install development dependencies
-pip install -r requirements-dev.txt
-
-# Run tests
-python -m pytest tests/
-
-# Format code
-black .
-```
 
 ## 📄 License
 
@@ -415,7 +394,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ### Getting Help
 
-1. **📚 Check Documentation** - [docs website](https://your-docs-website.com)
+1. **📚 Check Documentation** - [docs website](https://zwroee.github.io/NameMCSniper-Docs/)
 2. **🔍 Search Issues** - Look for similar problems
 3. **📝 Create Issue** - Provide detailed information
 4. **💬 Discord Community** - Join our support server
@@ -433,6 +412,6 @@ When reporting bugs, please include:
 
 **Made with ❤️ for the Minecraft community**
 
-[⭐ Star this repo](https://github.com/your-username/NameMcSniper) • [🐛 Report Bug](https://github.com/your-username/NameMcSniper/issues) • [💡 Request Feature](https://github.com/your-username/NameMcSniper/issues)
+[⭐ Star this repo](https://github.com/zwroee/NameMcSniper) • [🐛 Report Bug](https://github.com/zwroee/NameMcSniper/issues) • [💡 Request Feature](https://github.com/zwroee/NameMcSniper/issues)
 
 </div>
