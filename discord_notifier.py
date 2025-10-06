@@ -53,10 +53,14 @@ class DiscordNotifier:
         return embed
     
     async def send_webhook_notification(self, embed: Dict[str, Any], content: str = "") -> bool:
-        """Send notification via webhook"""
+        """Send notification via webhook with rate limiting protection"""
         if not self.webhook_url:
             logger.error("No webhook URL configured")
             return False
+        
+        # Ensure session is initialized
+        if not self.session or self.session.closed:
+            self.session = aiohttp.ClientSession()
         
         payload = {
             "embeds": [embed]
@@ -66,12 +70,25 @@ class DiscordNotifier:
             payload["content"] = content
         
         try:
+            # Add delay to prevent rate limiting
+            await asyncio.sleep(1)  # 1 second delay between requests
+            
             async with self.session.post(self.webhook_url, json=payload) as response:
                 if response.status == 204:
                     logger.debug("Webhook notification sent successfully")
                     return True
+                elif response.status == 429:
+                    logger.warning("Discord rate limited - skipping notification")
+                    return False
+                elif response.status == 1015:
+                    logger.warning("Cloudflare rate limited - disabling Discord notifications temporarily")
+                    return False
                 else:
-                    logger.error(f"Webhook failed with status {response.status}")
+                    response_text = await response.text()
+                    if "rate limited" in response_text.lower() or "cloudflare" in response_text.lower():
+                        logger.warning("Rate limited by Cloudflare - skipping Discord notifications")
+                        return False
+                    logger.error(f"Webhook failed with status {response.status}: {response_text[:200]}")
                     return False
         except Exception as e:
             logger.error(f"Error sending webhook notification: {e}")

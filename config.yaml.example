@@ -37,8 +37,16 @@ snipe:
   # Target username to snipe
   target_username: "DesiredUsername"
   
-  # Minecraft bearer token for authentication
+  # Minecraft bearer token for authentication (single token)
   bearer_token: "your_minecraft_bearer_token_here"
+  
+  # Multiple bearer tokens for mass sniping (optional)
+  # Use this to compete against multi-account snipers
+  bearer_tokens:
+    - "your_first_minecraft_bearer_token_here"
+    - "your_second_minecraft_bearer_token_here"
+    - "your_third_minecraft_bearer_token_here"
+    # Add as many tokens as you have accounts
   
   # Start sniping X seconds before the drop time
   start_sniping_at_seconds: 30
@@ -51,6 +59,11 @@ snipe:
   
   # Number of concurrent sniping requests
   concurrent_requests: 10
+  
+  # Rate limiting settings
+  max_backoff_seconds: 5        # Maximum time to wait when rate limited
+  adaptive_delays: true         # Automatically adjust delays based on server response
+  per_token_rate_limiting: true # Track rate limits separately for each token
   
   # Use multiple threads for sniping
   use_multiple_threads: true

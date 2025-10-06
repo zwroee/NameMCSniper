@@ -2,7 +2,7 @@
 
 <div align="center">
 
-![NameMC Sniper Logo](https://img.shields.io/badge/NameMC-Sniper-blue?style=for-the-badge&logo=minecraft)
+<img width="1536" height="324" alt="assets_task_01k6cfgfnce75rr55xznbme123_1759208092_img_1" src="https://github.com/user-attachments/assets/cf0a9ba6-a318-424b-a163-82f34b9915b0" />
 
 **A professional-grade Minecraft username sniper with advanced features**
 
@@ -10,7 +10,7 @@
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Code Style](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
 
-[📚 Documentation](https://your-docs-website.com) • [🚀 Quick Start](#quick-start) • [⚙️ Configuration](#configuration) • [🤝 Support](#support)
+[📚 Documentation](https://zwroee.github.io/NameMCSniper-Docs/) • [🚀 Quick Start](https://zwroee.github.io/NameMCSniper-Docs/#quick-start) • [⚙️ Configuration](https://zwroee.github.io/NameMCSniper-Docs/getting-started/configuration/) • [🤝 Support](https://zwroee.github.io/NameMCSniper-Docs/legal/support/)
 
 </div>
 
@@ -21,20 +21,20 @@
 <td width="50%">
 
 ### 🎯 **Core Features**
-- **High-Speed Sniping** - 10 concurrent workers with 25ms precision
-- **Bearer Token Auth** - Secure Minecraft authentication
-- **Exact Timing** - Starts 0.1s before drop, runs 10.1s after
-- **Smart Proxy Rotation** - Health-checked proxy management
+- **Ultra-Fast Sniping** - 40 concurrent workers with 8ms precision
+- **Multi-Token Support** - Mass sniping with multiple accounts
+- **Intelligent Rate Limiting** - Per-token backoff strategies
+- **Smart Proxy Rotation** - Residential proxy support (user-provided)
 - **Rich CLI Interface** - Beautiful terminal with colors & tables
 
 </td>
 <td width="50%">
 
 ### 🔧 **Advanced Features**
-- **Discord Integration** - Real-time notifications & embeds
-- **Countdown Notifications** - Multi-interval drop alerts
-- **Configuration Validation** - Built-in config error checking
-- **Comprehensive Logging** - Detailed file & console logs
+- **Time Synchronization** - NTP-based accurate timing
+- **Adaptive Delays** - Dynamic request timing optimization
+- **Network Optimization** - Oracle VPS performance tuning
+- **Error Recovery** - Graceful failure handling & retries
 - **Token Validation** - Test bearer tokens before sniping
 
 </td>
@@ -86,10 +86,10 @@ python Main.py snipe-at -u "Username" -w "12/25/2024 • 3∶30∶00 PM"  # Snip
 snipe:
   target_username: "YourDesiredUsername"
   bearer_token: "your_minecraft_bearer_token_here"
-  start_sniping_at_seconds: 30
-  max_snipe_attempts: 100
-  request_delay_ms: 25
-  concurrent_requests: 10
+  start_sniping_at_seconds: 0
+  max_snipe_attempts: 3000
+  request_delay_ms: 8
+  concurrent_requests: 40
 
 # Discord Notifications
 discord:
@@ -175,6 +175,7 @@ The interactive menu features a professional Matrix-style interface with:
 - **Real-time Information** - Current time display and status updates
 - **User-friendly Navigation** - Simple number-based option selection
 - **Professional Styling** - Consistent green theme throughout
+<img width="1918" height="983" alt="Screenshot 2025-09-30 063615" src="https://github.com/user-attachments/assets/387111dd-6039-46c1-b04c-73687cbb761a" />
 
 ### Command Line Interface
 
@@ -356,45 +357,45 @@ grep -i error logs/namemc_sniper_*.log
 grep -i "claim attempt" logs/namemc_sniper_*.log
 ```
 
+## 🚀 Performance
+
+### Optimized for Competitive Sniping
+
+| Metric | Value | Description |
+|--------|-------|-------------|
+| **Concurrent Workers** | 40 | Simultaneous sniping threads |
+| **Request Delay** | 8ms | Ultra-fast request timing |
+| **Max Attempts** | 3000 | High-volume attempt capability |
+| **Proxy Support** | Unlimited | Residential proxy rotation (user-provided) |
+| **Rate Limiting** | Per-token | Intelligent backoff strategies |
+| **Time Sync** | NTP-based | Sub-second timing accuracy |
+
+### Infrastructure Compatibility
+
+- ✅ **Oracle VPS** - Optimized for 2+ OCPUs
+- ✅ **Residential Proxies** - Compatible with premium proxy providers  
+- ✅ **Multi-Token** - Scale with multiple Microsoft accounts
+- ✅ **Global Timezones** - Automatic timezone detection
+- ✅ **Rate Limit Handling** - Smart 429 response management
+
 ## 📚 Documentation
 
 For comprehensive documentation, examples, and advanced configuration:
 
-**[📖 Visit our Documentation Website](https://your-docs-website.com)**
+**[📖 Visit our Documentation Website](https://zwroee.github.io/NameMCSniper-Docs/)**
 
-- 🎯 **Sniping Strategies** - Optimal settings for different scenarios
+- 🎯 **Sniping Strategies** - Multi-token and proxy optimization
 - 🔧 **API Reference** - Complete function and class documentation  
-- 📊 **Performance Tuning** - Advanced optimization techniques
-- 🤖 **Bot Integration** - Discord bot setup and commands
-- 📈 **Analytics** - Success rate tracking and statistics
+- 📊 **Performance Tuning** - Oracle VPS and rate limiting optimization
+- 🤖 **Discord Integration** - Webhook notifications and status updates
+- 📈 **Competitive Analysis** - Success rates against different sniper types
 
-## 👥 Contributors
+## 🫂 Authors
 
-Special thanks to everyone who contributed to this project:
+### Authors
+- **[zwroe]** -  [@zwroee](https://github.com/zwroee)
+- **[light]** - [@zerolight18](https://github.com/zerolight18)
 
-### Core Contributors
-- **[Your Name]** - *Project Lead & Main Developer* - [@your-github](https://github.com/your-username)
-- **[Collaborator Name]** - *Architecture & Performance Optimization* - Contributed via pair programming sessions
-
-### How to Contribute
-
-We welcome contributions! Please see our [Contributing Guide](CONTRIBUTING.md) for details.
-
-#### Development Setup
-```bash
-# Clone and setup development environment
-git clone https://github.com/your-username/NameMcSniper.git
-cd NameMcSniper
-
-# Install development dependencies
-pip install -r requirements-dev.txt
-
-# Run tests
-python -m pytest tests/
-
-# Format code
-black .
-```
 
 ## 📄 License
 
@@ -414,7 +415,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ### Getting Help
 
-1. **📚 Check Documentation** - [docs website](https://your-docs-website.com)
+1. **📚 Check Documentation** - [docs website](https://zwroee.github.io/NameMCSniper-Docs/)
 2. **🔍 Search Issues** - Look for similar problems
 3. **📝 Create Issue** - Provide detailed information
 4. **💬 Discord Community** - Join our support server
@@ -432,6 +433,6 @@ When reporting bugs, please include:
 
 **Made with ❤️ for the Minecraft community**
 
-[⭐ Star this repo](https://github.com/your-username/NameMcSniper) • [🐛 Report Bug](https://github.com/your-username/NameMcSniper/issues) • [💡 Request Feature](https://github.com/your-username/NameMcSniper/issues)
+[⭐ Star this repo](https://github.com/zwroee/NameMcSniper) • [🐛 Report Bug](https://github.com/zwroee/NameMcSniper/issues) • [💡 Request Feature](https://github.com/zwroee/NameMcSniper/issues)
 
 </div>

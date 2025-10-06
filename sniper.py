@@ -8,8 +8,43 @@ from dataclasses import dataclass
 
 from discord_notifier import DiscordNotifier
 from config import AppConfig
+from time_sync import TimeSync, AccurateTimer
+from collections import defaultdict
 
 logger = logging.getLogger(__name__)
+
+class RateLimitTracker:
+    """Track rate limits per token to optimize request distribution"""
+    
+    def __init__(self):
+        self.token_limits = defaultdict(lambda: {'last_limited': 0, 'backoff_until': 0})
+    
+    def is_token_limited(self, token: str) -> bool:
+        """Check if a token is currently rate limited"""
+        token_key = token[-8:] if token else "default"
+        return time.time() < self.token_limits[token_key]['backoff_until']
+    
+    def record_rate_limit(self, token: str, retry_after: float):
+        """Record a rate limit for a token"""
+        token_key = token[-8:] if token else "default"
+        self.token_limits[token_key]['last_limited'] = time.time()
+        self.token_limits[token_key]['backoff_until'] = time.time() + retry_after
+        logger.debug(f"Token ...{token_key} rate limited until {self.token_limits[token_key]['backoff_until']}")
+    
+    def get_best_token(self, tokens: list) -> str:
+        """Get the token with the least recent rate limiting"""
+        if not tokens:
+            return None
+        
+        # Filter out currently rate limited tokens
+        available_tokens = [t for t in tokens if not self.is_token_limited(t)]
+        
+        if not available_tokens:
+            # All tokens are rate limited, return the one that recovers soonest
+            return min(tokens, key=lambda t: self.token_limits[t[-8:]]['backoff_until'])
+        
+        # Return token with oldest rate limit (or never limited)
+        return min(available_tokens, key=lambda t: self.token_limits[t[-8:]]['last_limited'])
 
 @dataclass
 class SnipeResult:
@@ -29,6 +64,16 @@ class UsernameSniper:
         self.session = None
         self.proxy_manager = None
         self.is_running = False
+        
+        # Initialize time synchronization
+        self.time_sync = TimeSync()
+        self.timer = AccurateTimer(self.time_sync)
+        
+        # Initialize rate limiting tracker
+        self.rate_limit_tracker = RateLimitTracker()
+        
+        # Track sent notifications to prevent duplicates
+        self.sent_notifications = set()
         
         # Initialize proxy manager if enabled
         if self.config.proxy.enabled and self.config.proxy.proxies:
@@ -53,6 +98,58 @@ class UsernameSniper:
                 embed_color=self.config.discord.embed_color
             )
     
+    async def snipe_with_fallback(self, drop_times: List[datetime], username: str) -> SnipeResult:
+        """Snipe a username with multiple fallback drop times"""
+        if not drop_times:
+            logger.error("No drop times provided")
+            return SnipeResult(
+                success=False,
+                username=username,
+                attempts=0,
+                total_time=0,
+                error_message="No drop times provided"
+            )
+        
+        logger.info(f"Starting fallback sniper for username: {username}")
+        logger.info(f"Drop times: {[dt.isoformat() for dt in drop_times]}")
+        
+        # Try each drop time in order
+        for i, drop_time in enumerate(drop_times, 1):
+            logger.info(f"🎯 Attempting drop window {i}/{len(drop_times)}: {drop_time.isoformat()}")
+            
+            if self.discord_notifier:
+                try:
+                    await self.discord_notifier.notify_status_update(
+                        f"🎯 **Drop Window {i}/{len(drop_times)}**\n"
+                        f"Username: **{username}**\n"
+                        f"Drop time: {drop_time.strftime('%Y-%m-%d %H:%M:%S UTC')}"
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to send fallback window notification: {e}")
+            
+            result = await self.snipe_at_time(drop_time, username)
+            
+            if result.success:
+                logger.info(f"🎉 SUCCESS on drop window {i}!")
+                return result
+            else:
+                logger.warning(f"❌ Drop window {i} failed: {result.error_message}")
+                
+                # If there are more drop times, wait a bit before next attempt
+                if i < len(drop_times):
+                    logger.info(f"⏳ Preparing for next drop window in 5 seconds...")
+                    await asyncio.sleep(5)
+        
+        # All drop windows failed
+        logger.error(f"❌ All {len(drop_times)} drop windows failed for {username}")
+        return SnipeResult(
+            success=False,
+            username=username,
+            attempts=0,
+            total_time=0,
+            error_message=f"All {len(drop_times)} drop windows failed"
+        )
+
     async def snipe_at_time(self, drop_time: datetime, username: str) -> SnipeResult:
         """Snipe a username at the specified time"""
         if self.is_running:
@@ -66,6 +163,9 @@ class UsernameSniper:
             )
         
         self.is_running = True
+        # Reset notification tracking for new snipe
+        self.sent_notifications.clear()
+        
         logger.info(f"Starting sniper for username: {username}")
         logger.info(f"Drop time: {drop_time.isoformat()}")
         
@@ -81,10 +181,17 @@ class UsernameSniper:
                     error_message="Bearer token not configured"
                 )
             
-            # Initialize HTTP session
+            # Initialize HTTP session with aggressive settings
             try:
-                connector = aiohttp.TCPConnector(limit=100)
-                timeout_seconds = self.config.proxy.timeout if self.proxy_manager else 10
+                connector = aiohttp.TCPConnector(
+                    limit=500,  # Increased connection limit
+                    limit_per_host=100,
+                    ttl_dns_cache=300,
+                    use_dns_cache=True,
+                    keepalive_timeout=30,
+                    enable_cleanup_closed=True
+                )
+                timeout_seconds = self.config.proxy.timeout if self.proxy_manager else 5
                 timeout = aiohttp.ClientTimeout(total=timeout_seconds)
                 self.session = aiohttp.ClientSession(
                     connector=connector,
@@ -106,27 +213,40 @@ class UsernameSniper:
             
             # Send Discord notification
             if self.discord_notifier:
-                await self.discord_notifier.notify_status_update(
-                    f"🎯 Started sniper for **{username}**\n"
-                    f"Drop time: {drop_time.strftime('%Y-%m-%d %H:%M:%S UTC')}\n"
-                    f"Will start sniping 0.1 seconds before drop time"
-                )
+                try:
+                    await self.discord_notifier.notify_status_update(
+                        f"🎯 Started sniper for **{username}**\n"
+                        f"Drop time: {drop_time.strftime('%Y-%m-%d %H:%M:%S UTC')}\n"
+                        f"Will start sniping 0.1 seconds before drop time"
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to send Discord notification: {e}")
             
-            # Wait until snipe time
-            await self._wait_for_snipe_time(drop_time, username)
+            # Sync time first
+            await self.time_sync.sync_time()
+            
+            # Wait until snipe time with accurate timer (start 0.4s early for competitive edge)
+            snipe_start_time = drop_time - timedelta(milliseconds=400)
+            await self.timer.wait_until(
+                snipe_start_time, 
+                callback=lambda remaining, current, target: self._handle_countdown(remaining, current, target, username)
+            )
             
             # Start sniping
             result = await self._start_sniping(username)
             
             # Send final notification
             if self.discord_notifier:
-                await self.discord_notifier.notify_snipe_result(
-                    username=result.username,
-                    success=result.success,
-                    attempts=result.attempts,
-                    response_time=0,
-                    error_message=result.error_message
-                )
+                try:
+                    await self.discord_notifier.notify_snipe_result(
+                        username=result.username,
+                        success=result.success,
+                        attempts=result.attempts,
+                        response_time=0,
+                        error_message=result.error_message
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to send final Discord notification: {e}")
             
             return result
         
@@ -151,39 +271,24 @@ class UsernameSniper:
                 except Exception as e:
                     logger.warning(f"Error closing proxy manager: {e}")
     
-    async def _wait_for_snipe_time(self, drop_time: datetime, username: str):
-        """Wait until 0.1 seconds before drop time with countdown notifications"""
-        snipe_start_time = drop_time - timedelta(seconds=0.1)
-        current_time = datetime.now(timezone.utc)
+    async def _handle_countdown(self, time_remaining: float, current_time: datetime, target_time: datetime, username: str):
+        """Handle countdown notifications with accurate timing"""
+        # Notification intervals (in seconds) - more precise timing
+        notification_intervals = [3600, 1800, 600, 300, 60, 30, 10, 5, 1]  # 1h, 30m, 10m, 5m, 1m, 30s, 10s, 5s, 1s
         
-        if snipe_start_time > current_time:
-            wait_time = (snipe_start_time - current_time).total_seconds()
-            logger.info(f"Waiting {wait_time:.2f} seconds until snipe time...")
-            
-            # Notification intervals (in seconds)
-            notification_intervals = [3600, 1800, 900, 600, 300, 120, 60, 30, 10, 5]  # 1h, 30m, 15m, 10m, 5m, 2m, 1m, 30s, 10s, 5s
-            notified_intervals = set()
-            
-            # Main countdown loop
-            while wait_time > 0:
-                # Check for notification intervals
-                for interval in notification_intervals:
-                    if wait_time <= interval and interval not in notified_intervals:
-                        notified_intervals.add(interval)
-                        await self._send_countdown_notification(interval, drop_time, username)
-                        break
-                
-                # Show console countdown for last 60 seconds
-                if wait_time <= 60:
-                    logger.info(f"🚨 Starting in {wait_time:.0f} seconds...")
-                
-                # Sleep for appropriate interval
-                sleep_time = min(1 if wait_time <= 60 else 10, wait_time)
-                await asyncio.sleep(sleep_time)
-                
-                # Recalculate wait time
-                current_time = datetime.now(timezone.utc)
-                wait_time = (snipe_start_time - current_time).total_seconds()
+        # Check if we should send a notification
+        for interval in notification_intervals:
+            # Check if we're within 0.5 seconds of the notification time
+            if abs(time_remaining - interval) <= 0.5 and interval not in self.sent_notifications:
+                self.sent_notifications.add(interval)
+                await self._send_countdown_notification(interval, target_time, username)
+                break
+        
+        # Show console countdown for last 60 seconds
+        if time_remaining <= 60:
+            logger.info(f"🚨 Starting in {time_remaining:.1f} seconds... (Accurate time: {current_time.strftime('%H:%M:%S.%f')[:-3]})")
+        elif time_remaining <= 600:  # Last 10 minutes
+            logger.info(f"⏰ {time_remaining:.0f} seconds remaining...")
     
     async def _send_countdown_notification(self, seconds_remaining: int, drop_time: datetime, username: str):
         """Send Discord countdown notification"""
@@ -206,7 +311,7 @@ class UsernameSniper:
             )
             logger.info(f"📢 Sent countdown notification: {time_str} remaining")
         except Exception as e:
-            logger.error(f"Failed to send countdown notification: {e}")
+            logger.warning(f"Failed to send countdown notification: {e}")
     
     async def _start_sniping(self, username: str) -> SnipeResult:
         """Start the sniping process"""
@@ -217,10 +322,28 @@ class UsernameSniper:
         attempts = 0
         success = False
         
-        # Create workers
+        # Create workers - distributed across multiple tokens
+        worker_count = self.config.snipe.concurrent_requests
+        tokens = self.config.snipe.bearer_tokens
         workers = []
-        for i in range(10):  # 10 concurrent workers
-            worker = asyncio.create_task(self._snipe_worker(username, stop_time))
+        
+        # Validate we have tokens
+        if not tokens:
+            logger.error("❌ No bearer tokens configured! Check your config.yaml")
+            return SnipeResult(
+                success=False,
+                username=username,
+                attempts=0,
+                total_time=0.0,
+                error_message="No bearer tokens configured"
+            )
+        
+        logger.info(f"🔥 Using {len(tokens)} tokens with {worker_count} total workers")
+        
+        for i in range(worker_count):
+            # Distribute workers evenly across available tokens
+            token = tokens[i % len(tokens)]
+            worker = asyncio.create_task(self._snipe_worker(username, stop_time, token))
             workers.append(worker)
         
         try:
@@ -248,16 +371,17 @@ class UsernameSniper:
             error_message=None if success else "Failed to claim username"
         )
     
-    async def _snipe_worker(self, username: str, stop_time: float) -> dict:
-        """Individual sniping worker"""
+    async def _snipe_worker(self, username: str, stop_time: float, bearer_token: str = None) -> dict:
+        """Individual sniping worker with optional token"""
         attempts = 0
         worker_id = id(asyncio.current_task())
+        token_info = f" (Token: ...{bearer_token[-8:]})" if bearer_token else ""
         
-        logger.info(f"Worker {worker_id} started sniping {username}")
+        logger.info(f"Worker {worker_id}{token_info} started sniping {username}")
         
         while time.time() < stop_time:
             try:
-                result = await self._claim_username(username)
+                result = await self._claim_username(username, bearer_token)
                 attempts += 1
                 
                 # Log every 10th attempt to show progress
@@ -268,7 +392,22 @@ class UsernameSniper:
                     logger.info(f"🎉 Worker {worker_id} SUCCESS after {attempts} attempts!")
                     return {'success': True, 'attempts': attempts}
                 
-                await asyncio.sleep(0.025)  # 25ms delay
+                # Handle rate limiting intelligently
+                if result.get('status') == 429:
+                    retry_after = result.get('retry_after', 1.0)
+                    # Cap backoff at configured maximum to avoid missing the drop window
+                    max_backoff = getattr(self.config.snipe, 'max_backoff_seconds', 5)
+                    backoff_time = min(retry_after, max_backoff)
+                    logger.warning(f"Worker {worker_id} backing off for {backoff_time:.1f}s")
+                    await asyncio.sleep(backoff_time)
+                elif result.get('status') == 403:
+                    # Account cooldown - longer delay
+                    logger.warning(f"Worker {worker_id} hit account cooldown, waiting 2s")
+                    await asyncio.sleep(2.0)
+                else:
+                    # Use configured delay for normal requests
+                    delay_seconds = self.config.snipe.request_delay_ms / 1000.0
+                    await asyncio.sleep(delay_seconds)
                 
             except Exception as e:
                 logger.error(f"Worker {worker_id} error: {e}")
@@ -278,17 +417,22 @@ class UsernameSniper:
         logger.info(f"Worker {worker_id} finished with {attempts} attempts (no success)")
         return {'success': False, 'attempts': attempts}
     
-    async def _claim_username(self, username: str) -> dict:
-        """Try to claim a username"""
+    async def _claim_username(self, username: str, bearer_token: str = None) -> dict:
+        """Try to claim a username with specified token"""
         # Safety check for session
         if not self.session:
             logger.error("HTTP session is None - cannot make request")
             return {'success': False, 'error': 'Session not initialized'}
         
+        # Use provided token or fall back to primary token
+        token = bearer_token or self.config.snipe.bearer_token
+        
         url = f"https://api.minecraftservices.com/minecraft/profile/name/{username}"
         headers = {
-            'Authorization': f'Bearer {self.config.snipe.bearer_token}',
-            'User-Agent': 'MinecraftSniper/1.0'
+            'Authorization': f'Bearer {token}',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Content-Type': 'application/json',
+            'Accept': 'application/json'
         }
         
         # Get proxy for this request if proxy manager is available
@@ -302,23 +446,55 @@ class UsernameSniper:
                 logger.warning(f"Failed to get proxy: {e}")
         
         try:
-            async with self.session.put(url, headers=headers, proxy=proxy) as response:
+            async with self.session.put(url, headers=headers, proxy=proxy, timeout=aiohttp.ClientTimeout(total=2)) as response:
                 response_text = await response.text()
                 
                 # Log detailed response for debugging
                 proxy_info = f" via {proxy}" if proxy else " (direct)"
-                logger.info(f"Claim attempt{proxy_info} - Status: {response.status}, Response: {response_text[:200]}")
+                logger.info(f"Claim attempt{proxy_info} - Status: {response.status}")
                 
                 if response.status == 200:
                     logger.info(f"🎉 SUCCESS! Claimed username: {username}")
+                    logger.info(f"Response: {response_text}")
+                    return {'success': True, 'response': response_text}
                 elif response.status == 400:
-                    logger.warning(f"Bad request (400) - Username might be taken or invalid: {response_text}")
+                    logger.warning(f"Bad request (400) - Username might be taken or invalid")
+                    logger.debug(f"Response: {response_text}")
+                    return {'success': False, 'error': 'Bad request - username taken or invalid', 'status': 400}
                 elif response.status == 401:
-                    logger.error(f"Unauthorized (401) - Bearer token might be invalid")
+                    logger.error(f"Unauthorized (401) - Bearer token is invalid or expired")
+                    logger.debug(f"Response: {response_text}")
+                    return {'success': False, 'error': 'Invalid bearer token', 'status': 401}
                 elif response.status == 403:
-                    logger.warning(f"Forbidden (403) - Account might be on cooldown: {response_text}")
+                    logger.warning(f"Forbidden (403) - Account on cooldown or username unavailable")
+                    logger.debug(f"Response: {response_text}")
+                    return {'success': False, 'error': 'Account on cooldown or username unavailable', 'status': 403}
+                elif response.status == 404:
+                    logger.error(f"Not found (404) - Account doesn't own Minecraft")
+                    logger.debug(f"Response: {response_text}")
+                    return {'success': False, 'error': 'Account does not own Minecraft', 'status': 404}
                 elif response.status == 429:
-                    logger.warning(f"Rate limited (429) - Too many requests")
+                    # Extract retry-after header if present
+                    retry_after = response.headers.get('Retry-After', '1')
+                    try:
+                        retry_seconds = float(retry_after)
+                    except (ValueError, TypeError):
+                        retry_seconds = 1.0
+                    
+                    logger.warning(f"Rate limited (429) - Backing off for {retry_seconds}s")
+                    logger.debug(f"Response: {response_text}")
+                    
+                    # Record rate limit for this token
+                    if hasattr(self, 'rate_limit_tracker') and token:
+                        self.rate_limit_tracker.record_rate_limit(token, retry_seconds)
+                    
+                    # Return rate limit info for intelligent handling
+                    return {
+                        'success': False, 
+                        'error': 'Rate limited', 
+                        'status': 429,
+                        'retry_after': retry_seconds
+                    }
                 else:
                     logger.warning(f"Unexpected status {response.status}: {response_text}")
                 
@@ -328,6 +504,12 @@ class UsernameSniper:
                     'username': username,
                     'response': response_text
                 }
+        except asyncio.TimeoutError:
+            logger.warning(f"Timeout claiming {username}")
+            return {'success': False, 'error': 'Request timeout', 'status': 'timeout'}
+        except aiohttp.ClientError as e:
+            logger.error(f"Network error claiming {username}: {e}")
+            return {'success': False, 'error': f'Network error: {str(e)}', 'status': 'network_error'}
         except Exception as e:
-            logger.error(f"Error claiming {username}: {e}")
-            return {'success': False, 'error': str(e)}
+            logger.error(f"Unexpected error claiming {username}: {e}")
+            return {'success': False, 'error': str(e), 'status': 'unknown_error'}

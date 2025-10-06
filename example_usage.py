@@ -37,6 +37,56 @@ async def example_basic_usage():
     
     # Create and start sniper
     sniper = UsernameSniper(config)
+    
+    # Single drop time
+    drop_time = datetime(2024, 12, 25, 15, 30, 0, tzinfo=timezone.utc)
+    result = await sniper.snipe_at_time(drop_time, "ExampleUsername")
+    
+    print(f"Single snipe result: {result.success}")
+
+async def example_fallback_usage():
+    """Example of fallback sniper with multiple drop times"""
+    
+    # Setup logging
+    setup_logging(log_level="INFO", debug_mode=True)
+    
+    # Create configuration
+    config = AppConfig(
+        snipe=SnipeConfig(
+            target_username="ExampleUsername",
+            bearer_token="your_bearer_token_here",
+            start_sniping_at_seconds=30,
+            max_snipe_attempts=50,
+            concurrent_requests=10
+        ),
+        discord=DiscordConfig(
+            enabled=True,
+            webhook_url="https://discord.com/api/webhooks/your/webhook"
+        )
+    )
+    
+    # Create sniper
+    sniper = UsernameSniper(config)
+    
+    # Multiple fallback drop times
+    drop_times = [
+        datetime(2024, 12, 25, 15, 30, 0, tzinfo=timezone.utc),  # Primary drop
+        datetime(2024, 12, 25, 15, 31, 0, tzinfo=timezone.utc),  # Fallback 1
+        datetime(2024, 12, 25, 15, 32, 0, tzinfo=timezone.utc),  # Fallback 2
+    ]
+    
+    # Run fallback sniper
+    result = await sniper.snipe_with_fallback(drop_times, "ExampleUsername")
+    
+    print(f"Fallback snipe result: {result.success}")
+    if result.success:
+        print(f"Successfully claimed username!")
+    else:
+        print(f"Failed after {len(drop_times)} attempts: {result.error_message}")
+
+async def example_advanced_usage():
+    """Example of advanced configuration with proxies"""
+    sniper = UsernameSniper(config)
     await sniper.start_monitoring()
 
 async def example_with_proxies():
@@ -148,13 +198,17 @@ def example_config_management():
         print("Configuration is valid!")
 
 if __name__ == "__main__":
-    print("NameMC Sniper - Example Usage")
+    # Run basic example
+    print("Running basic usage example...")
+    asyncio.run(example_basic_usage())
+    
+    print("\nRunning fallback usage example...")
+    asyncio.run(example_fallback_usage())
     print("This file contains examples of how to use the sniper components.")
     print("Edit the bearer tokens and URLs before running any examples.")
     
     # Uncomment the example you want to run:
     
-    # asyncio.run(example_basic_usage())
     # asyncio.run(example_with_proxies())
     # asyncio.run(example_api_testing())
     # asyncio.run(example_proxy_testing())

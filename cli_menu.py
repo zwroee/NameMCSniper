@@ -71,7 +71,7 @@ class NameMCSniperCLI:
         options = """
 [bold green]┌─[/bold green] [bold yellow]Sniper Operations[/bold yellow] [bold green]─────────┐[/bold green] [bold green]┌─[/bold green] [bold yellow]Configuration[/bold yellow] [bold green]──────────┐[/bold green] [bold green]┌─[/bold green] [bold yellow]Tools & Info[/bold yellow] [bold green]────────────┐[/bold green]
 [bold green]│[/bold green] [bold white][1][/bold white] Snipe at Time            [bold green]│[/bold green] [bold green]│[/bold green] [bold white][11][/bold white] Create Config          [bold green]│[/bold green] [bold green]│[/bold green] [bold white][21][/bold white] Test Bearer Token      [bold green]│[/bold green]
-[bold green]│[/bold green]                              [bold green]│[/bold green] [bold green]│[/bold green] [bold white][12][/bold white] Edit Config            [bold green]│[/bold green] [bold green]│[/bold green] [bold white][22][/bold white] Test Proxies           [bold green]│[/bold green]
+[bold green]│[/bold green] [bold white][2][/bold white] Fallback Snipe           [bold green]│[/bold green] [bold green]│[/bold green] [bold white][12][/bold white] Edit Config            [bold green]│[/bold green] [bold green]│[/bold green] [bold white][22][/bold white] Test Proxies           [bold green]│[/bold green]
 [bold green]│[/bold green]                              [bold green]│[/bold green] [bold green]│[/bold green] [bold white][13][/bold white] Validate Config        [bold green]│[/bold green] [bold green]│[/bold green] [bold white][23][/bold white] View Logs              [bold green]│[/bold green]
 [bold green]│[/bold green]                              [bold green]│[/bold green] [bold green]│[/bold green] [bold white][14][/bold white] Reset Config           [bold green]│[/bold green] [bold green]│[/bold green] [bold white][24][/bold white] System Info            [bold green]│[/bold green]
 [bold green]└─────────────────────────────┘[/bold green] [bold green]└───────────────────────────┘[/bold green] [bold green]└───────────────────────────┘[/bold green]
@@ -131,6 +131,68 @@ class NameMCSniperCLI:
         panel = Panel(content, title=f"[bold green]{title}[/bold green]", border_style="green")
         console.print(panel)
         console.input("\n[dim]Press Enter to continue...[/dim]")
+    
+    async def _get_account_info(self, bearer_token: str) -> dict:
+        """Get Minecraft account info from bearer token"""
+        try:
+            import aiohttp
+            
+            url = "https://api.minecraftservices.com/minecraft/profile"
+            headers = {
+                'Authorization': f'Bearer {bearer_token}',
+                'User-Agent': 'MinecraftSniper/1.0'
+            }
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=headers) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        return {
+                            'username': data.get('name', 'Unknown'),
+                            'uuid': data.get('id', 'Unknown'),
+                            'valid': True
+                        }
+                    else:
+                        return {
+                            'username': 'Invalid Token',
+                            'uuid': 'N/A',
+                            'valid': False
+                        }
+        except Exception as e:
+            return {
+                'username': 'Error Getting Info',
+                'uuid': 'N/A', 
+                'valid': False
+            }
+    
+    def _parse_namemc_time(self, drop_window: str) -> datetime:
+        """Parse NameMC drop time format: '9/30/2025 • 11∶46∶32 PM'"""
+        # Validate format
+        if '•' not in drop_window or '∶' not in drop_window:
+            raise ValueError("Invalid format! Use exact NameMC format with • and ∶")
+        
+        try:
+            from datetime import timedelta
+            import time as time_module
+            
+            # Clean the format: replace NameMC special characters
+            clean_window = drop_window.replace('•', '').replace('∶', ':').strip()
+            parsed_time = datetime.strptime(clean_window, '%m/%d/%Y %I:%M:%S %p')
+            
+            # NameMC displays times in the user's local timezone, convert to UTC
+            # Get the user's local timezone offset
+            local_offset_seconds = -time_module.timezone if time_module.daylight == 0 else -time_module.altzone
+            local_offset = timedelta(seconds=local_offset_seconds)
+            local_tz = timezone(local_offset)
+            
+            # Set as local time, then convert to UTC
+            parsed_time = parsed_time.replace(tzinfo=local_tz)
+            parsed_time = parsed_time.astimezone(timezone.utc)
+            
+            return parsed_time
+            
+        except ValueError as e:
+            raise ValueError(f"Could not parse time format. Expected: M/D/YYYY • H∶MM∶SS AM/PM, got: {drop_window}")
     
     # Menu option handlers
     def create_config(self):
@@ -225,16 +287,52 @@ class NameMCSniperCLI:
                 return
             
             time_until = (parsed_time - now).total_seconds()
+            
+            # Convert to readable format
+            hours = int(time_until // 3600)
+            minutes = int((time_until % 3600) // 60)
+            seconds = int(time_until % 60)
+            
             console.print(f"\n[green]✅ Drop time parsed successfully![/green]")
-            console.print(f"[cyan]Time until drop: {time_until/3600:.2f} hours ({time_until:.0f} seconds)[/cyan]")
+            console.print(f"[cyan]Time until drop: {hours}h {minutes}m {seconds}s ({time_until:.0f} seconds total)[/cyan]")
             
             confirm = self.get_user_input("Start sniper? (y/N)")
             if confirm.lower() != 'y':
                 return
             
-            # Load config and start sniper
+            # Load config first to get bearer token
             self.config = self.config_manager.load_config()
             self.config.snipe.target_username = username
+            
+            # Clear screen and show startup message
+            self.clear_screen()
+            console.print("[bold green]🚀 SNIPER STARTED![/bold green]\n")
+            
+            # Get account info
+            console.print("[dim]Getting account information...[/dim]")
+            account_info = await self._get_account_info(self.config.snipe.bearer_token)
+            
+            console.print(f"[cyan]Sniping Account:[/cyan] [bold white]{account_info['username']}[/bold white]")
+            if account_info['valid']:
+                console.print(f"[cyan]Account UUID:[/cyan] [dim]{account_info['uuid'][:8]}...{account_info['uuid'][-4:]}[/dim]")
+                console.print(f"[cyan]Token Status:[/cyan] [bold green]✅ Valid[/bold green]")
+            else:
+                console.print(f"[cyan]Token Status:[/cyan] [bold red]❌ Invalid/Expired[/bold red]")
+            
+            console.print(f"[cyan]Target Username:[/cyan] [bold white]{username}[/bold white]")
+            console.print(f"[cyan]Drop Time:[/cyan] [bold white]{parsed_time.strftime('%Y-%m-%d %H:%M:%S UTC')}[/bold white]")
+            console.print(f"[cyan]Status:[/cyan] [bold yellow]ACTIVE - Waiting for drop time...[/bold yellow]")
+            
+            # Show countdown
+            time_until = (parsed_time - datetime.now(timezone.utc)).total_seconds()
+            if time_until > 0:
+                hours = int(time_until // 3600)
+                minutes = int((time_until % 3600) // 60)
+                seconds = int(time_until % 60)
+                console.print(f"[cyan]Time Until Drop:[/cyan] [bold yellow]{hours}h {minutes}m {seconds}s[/bold yellow]")
+            
+            console.print(f"\n[bold green]✅ Sniper is now running! Check logs for detailed progress.[/bold green]")
+            console.print(f"[dim]Press Ctrl+C to stop the sniper if needed.[/dim]\n")
             
             sniper = UsernameSniper(self.config)
             result = await sniper.snipe_at_time(parsed_time, username)
@@ -246,6 +344,122 @@ class NameMCSniperCLI:
                 
         except Exception as e:
             self.show_error(f"Error: {e}")
+    
+    async def fallback_snipe(self):
+        """Fallback snipe with multiple drop times"""
+        self.clear_screen()
+        console.print("[bold yellow]🎯 Fallback Snipe Mode[/bold yellow]\n")
+        
+        username = self.get_user_input("Enter username to snipe")
+        if not username:
+            self.show_error("Username is required!")
+            return
+        
+        # Get number of drop times
+        try:
+            num_drops = int(self.get_user_input("How many drop times? (2-5)"))
+            if num_drops < 2 or num_drops > 5:
+                self.show_error("Please enter between 2-5 drop times")
+                return
+        except ValueError:
+            self.show_error("Please enter a valid number")
+            return
+        
+        # Collect drop times
+        drop_times = []
+        for i in range(num_drops):
+            while True:
+                time_input = self.get_user_input(f"Drop time {i+1} (NameMC format: M/D/YYYY • H∶MM∶SS AM/PM)")
+                if not time_input:
+                    return
+                
+                try:
+                    # Parse NameMC format: "9/30/2025 • 11∶46∶32 PM"
+                    parsed_time = self._parse_namemc_time(time_input)
+                    
+                    # Check if time is in the future
+                    if parsed_time <= datetime.now(timezone.utc):
+                        self.show_error("Drop time must be in the future!")
+                        continue
+                    
+                    drop_times.append(parsed_time)
+                    console.print(f"[green]✅ Drop time {i+1} set: {parsed_time.strftime('%Y-%m-%d %H:%M:%S UTC')}[/green]")
+                    console.print(f"[dim]    Original: {time_input}[/dim]")
+                    break
+                    
+                except ValueError as e:
+                    self.show_error(f"Invalid NameMC format! {str(e)}")
+                    console.print("[yellow]Example: 9/30/2025 • 11∶46∶32 PM[/yellow]")
+                    continue
+        
+        # Load config
+        try:
+            self.config = self.config_manager.load_config()
+            if not self.config.snipe.bearer_token:
+                self.show_error("Bearer token not configured! Use option 11 to setup config.")
+                return
+        except Exception as e:
+            self.show_error(f"Config error: {e}")
+            return
+        
+        # Override username in config
+        self.config.snipe.target_username = username
+        
+        # Show summary
+        console.print(f"\n[green]Fallback Snipe Summary:[/green]")
+        console.print(f"Username: [bold]{username}[/bold]")
+        console.print(f"Drop Windows: [bold]{len(drop_times)}[/bold]")
+        for i, dt in enumerate(drop_times, 1):
+            console.print(f"  {i}. {dt.strftime('%Y-%m-%d %H:%M:%S UTC')}")
+        
+        confirm = self.get_user_input("Start fallback snipe? (y/N)")
+        if confirm.lower() != 'y':
+            return
+        
+        # Load config and override username
+        self.config.snipe.target_username = username
+        
+        # Clear screen and show startup message
+        self.clear_screen()
+        console.print("[bold green]🚀 FALLBACK SNIPER STARTED![/bold green]\n")
+        
+        # Get account info
+        console.print("[dim]Getting account information...[/dim]")
+        account_info = await self._get_account_info(self.config.snipe.bearer_token)
+        
+        console.print(f"[cyan]Sniping Account:[/cyan] [bold white]{account_info['username']}[/bold white]")
+        if account_info['valid']:
+            console.print(f"[cyan]Account UUID:[/cyan] [dim]{account_info['uuid'][:8]}...{account_info['uuid'][-4:]}[/dim]")
+            console.print(f"[cyan]Token Status:[/cyan] [bold green]✅ Valid[/bold green]")
+        else:
+            console.print(f"[cyan]Token Status:[/cyan] [bold red]❌ Invalid/Expired[/bold red]")
+        
+        console.print(f"[cyan]Target Username:[/cyan] [bold white]{username}[/bold white]")
+        console.print(f"[cyan]Drop Windows:[/cyan] [bold white]{len(drop_times)}[/bold white]")
+        console.print(f"[cyan]Status:[/cyan] [bold yellow]ACTIVE - Monitoring drop times...[/bold yellow]")
+        console.print(f"[cyan]Next Window:[/cyan] [bold white]{drop_times[0].strftime('%Y-%m-%d %H:%M:%S UTC')}[/bold white]")
+        
+        # Show live status
+        time_until_first = (drop_times[0] - datetime.now(timezone.utc)).total_seconds()
+        if time_until_first > 0:
+            hours = int(time_until_first // 3600)
+            minutes = int((time_until_first % 3600) // 60)
+            seconds = int(time_until_first % 60)
+            console.print(f"[cyan]Time Until First Drop:[/cyan] [bold yellow]{hours}h {minutes}m {seconds}s[/bold yellow]")
+        
+        console.print(f"\n[bold green]✅ Sniper is now running! Check logs for detailed progress.[/bold green]")
+        console.print(f"[dim]Press Ctrl+C to stop the sniper if needed.[/dim]\n")
+        
+        try:
+            sniper = UsernameSniper(self.config)
+            result = await sniper.snipe_with_fallback(drop_times, username)
+            
+            if result.success:
+                self.show_success(f"Successfully claimed {username}!")
+            else:
+                self.show_error(f"Failed to claim {username}. Error: {result.error_message}")
+        except Exception as e:
+            self.show_error(f"Snipe failed: {e}")
     
     async def test_proxies(self):
         """Test proxy connections"""
@@ -527,50 +741,65 @@ class NameMCSniperCLI:
             self.show_error(f"Failed to load config: {e}")
     
     async def test_bearer_token(self):
-        """Test bearer token"""
+        """Test bearer token validity"""
         self.clear_screen()
-        console.print("[bold yellow]🔑 Bearer Token Test[/bold yellow]\n")
+        console.print("[bold yellow]🔑 Testing Bearer Token[/bold yellow]\n")
         
         try:
-            self.config = self.config_manager.load_config()
-            if not self.config.snipe.bearer_token or self.config.snipe.bearer_token == "your_minecraft_bearer_token_here":
-                self.show_error("Bearer token not configured!")
+            config = self.config_manager.load_config()
+            if not config.snipe.bearer_token:
+                self.show_error("No bearer token configured!")
                 return
             
+            console.print("[dim]Testing token validity...[/dim]")
+            
+            # Test token by getting profile info
             import aiohttp
             url = "https://api.minecraftservices.com/minecraft/profile"
             headers = {
-                'Authorization': f'Bearer {self.config.snipe.bearer_token}',
-                'User-Agent': 'MinecraftSniper/1.0'
+                'Authorization': f'Bearer {config.snipe.bearer_token}',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Content-Type': 'application/json',
+                'Accept': 'application/json'
             }
             
-            try:
-                with console.status("[bold green]Testing bearer token..."):
-                    async with aiohttp.ClientSession() as session:
-                        async with session.get(url, headers=headers) as response:
-                            if response.status == 200:
-                                profile_data = await response.json()
-                                current_name = profile_data.get('name', 'Unknown')
-                                uuid = profile_data.get('id', 'Unknown')
-                                
-                                info = f"""[green]✅ Bearer token is valid![/green]
-
-[green]Account Information:[/green]
-• Username: [bold]{current_name}[/bold]
-• UUID: [bold]{uuid}[/bold]
-• Token Status: [bold green]Active[/bold green]
-"""
-                                self.show_info("Token Test Results", info)
-                            elif response.status == 401:
-                                self.show_error("Bearer token is invalid or expired")
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=headers) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        console.print(f"[green]✅ Token is valid![/green]")
+                        console.print(f"[cyan]Account: {data.get('name', 'Unknown')}[/cyan]")
+                        console.print(f"[cyan]UUID: {data.get('id', 'Unknown')}[/cyan]")
+                        
+                        # Test name change capability
+                        console.print(f"\n[dim]Testing name change capability...[/dim]")
+                        test_url = f"https://api.minecraftservices.com/minecraft/profile/name/TestUsername123456789"
+                        async with session.put(test_url, headers=headers) as test_response:
+                            test_text = await test_response.text()
+                            if test_response.status == 400:
+                                console.print(f"[green]✅ Name change API accessible (got expected 400 for invalid name)[/green]")
+                            elif test_response.status == 401:
+                                console.print(f"[red]❌ Token lacks name change permissions![/red]")
+                            elif test_response.status == 403:
+                                console.print(f"[yellow]⚠️ Account on cooldown or other restriction[/yellow]")
+                            elif test_response.status == 404:
+                                console.print(f"[red]❌ Account doesn't own Minecraft![/red]")
                             else:
-                                response_text = await response.text()
-                                self.show_error(f"Token validation failed: HTTP {response.status} - {response_text}")
-            except Exception as e:
-                self.show_error(f"Token test error: {e}")
-            
+                                console.print(f"[yellow]⚠️ Unexpected test response: {test_response.status}[/yellow]")
+                                console.print(f"[dim]{test_text[:200]}[/dim]")
+                        
+                    elif response.status == 401:
+                        console.print(f"[red]❌ Token is invalid or expired![/red]")
+                        console.print(f"[yellow]Please get a new bearer token from minecraft.net[/yellow]")
+                    else:
+                        console.print(f"[yellow]⚠️ Unexpected response: {response.status}[/yellow]")
+                        response_text = await response.text()
+                        console.print(f"[dim]{response_text[:200]}[/dim]")
+        
         except Exception as e:
-            self.show_error(f"Config error: {e}")
+            self.show_error(f"Error testing token: {e}")
+        
+        console.input("\n[dim]Press Enter to continue...[/dim]")
     
     def show_help(self):
         """Show help information"""
@@ -635,6 +864,8 @@ This tool is for educational purposes only. Please comply with Minecraft's Terms
                     break
                 elif choice == "1":
                     await self.snipe_at_time()
+                elif choice == "2":
+                    await self.fallback_snipe()
                 elif choice == "11":
                     self.create_config()
                 elif choice == "12":

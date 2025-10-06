@@ -14,7 +14,7 @@ import asyncio
 import sys
 import signal
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 
 import click
 from rich.console import Console
@@ -277,21 +277,28 @@ def snipe_at(config, username, drop_window):
             console.print(f"[red]Your input: '{drop_window}'[/red]")
             console.print(f"[red]Expected: M/D/YYYY • H∶MM∶SS AM/PM[/red]")
             return
-        # Treat as local time - assume it's already in the correct local timezone
-        # Convert to UTC by adding the local timezone offset
+        # NameMC displays times in the user's local timezone
+        # Convert from local timezone to UTC
         import time
+        from datetime import datetime, timezone, timedelta
+        
+        # Get the user's local timezone offset
         local_offset_seconds = -time.timezone if time.daylight == 0 else -time.altzone
         local_offset = timedelta(seconds=local_offset_seconds)
         local_tz = timezone(local_offset)
         
-        # Apply local timezone to parsed time
+        # Apply user's local timezone to parsed time
         parsed_time = parsed_time.replace(tzinfo=local_tz)
         parsed_time = parsed_time.astimezone(timezone.utc)
         
-        # Check if time is in the future
+        # Check if time is in the future (allow 60 seconds grace period for clock drift)
         now = datetime.now(timezone.utc)
-        if parsed_time <= now:
+        grace_period = timedelta(seconds=60)
+        if parsed_time <= (now - grace_period):
             console.print(f"[red]Error: Drop window time must be in the future.[/red]")
+            console.print(f"[yellow]Current time: {now.strftime('%Y-%m-%d %H:%M:%S UTC')}[/yellow]")
+            console.print(f"[yellow]Your time: {parsed_time.strftime('%Y-%m-%d %H:%M:%S UTC')}[/yellow]")
+            console.print(f"[yellow]Tip: Your system clock may be slow. Try a time 1+ minutes in the future.[/yellow]")
             return
         
         time_until = (parsed_time - now).total_seconds()
@@ -329,6 +336,101 @@ def snipe_at(config, username, drop_window):
             ))
     
     asyncio.run(run_snipe())
+
+@cli.command()
+@click.option('--username', '-u', required=True, help='Username to snipe')
+@click.option('--times', '-t', required=True, multiple=True, help='Drop times in NameMC format "M/D/YYYY • H∶MM∶SS AM/PM" (can specify multiple)')
+@click.option('--config', '-c', default='config.yaml', help='Configuration file path')
+def snipe_fallback(username, times, config):
+    """Snipe a username with multiple fallback drop times"""
+    if len(times) < 2:
+        console.print("[red]❌ Please provide at least 2 drop times for fallback sniping[/red]")
+        console.print("[yellow]Example: python Main.py snipe-fallback -u Username -t \"12/25/2024 • 3∶30∶00 PM\" -t \"12/25/2024 • 3∶31∶00 PM\"[/yellow]")
+        return
+    
+    # Load configuration
+    config_manager = ConfigManager(config)
+    try:
+        app_config = config_manager.load_config()
+    except Exception as e:
+        console.print(f"[red]❌ Failed to load config: {e}[/red]")
+        return
+    
+    # Override username in config
+    app_config.snipe.target_username = username
+    
+    # Parse drop times using NameMC format
+    drop_times = []
+    for time_str in times:
+        try:
+            # Parse NameMC format: "9/30/2025 • 11∶46∶32 PM"
+            if '•' not in time_str or '∶' not in time_str:
+                console.print(f"[red]❌ Invalid NameMC format: '{time_str}'[/red]")
+                console.print("[yellow]Use format: M/D/YYYY • H∶MM∶SS AM/PM[/yellow]")
+                return
+            
+            # Clean the format: replace NameMC special characters
+            import time as time_module
+            from datetime import timedelta
+            
+            clean_window = time_str.replace('•', '').replace('∶', ':').strip()
+            parsed_time = datetime.strptime(clean_window, '%m/%d/%Y %I:%M:%S %p')
+            
+            # NameMC displays times in the user's local timezone, convert to UTC
+            # Get the user's local timezone offset
+            local_offset_seconds = -time_module.timezone if time_module.daylight == 0 else -time_module.altzone
+            local_offset = timedelta(seconds=local_offset_seconds)
+            local_tz = timezone(local_offset)
+            
+            # Set as local time, then convert to UTC
+            parsed_time = parsed_time.replace(tzinfo=local_tz)
+            parsed_time = parsed_time.astimezone(timezone.utc)
+            
+            # Allow 60 second grace period for clock drift
+            now = datetime.now(timezone.utc)
+            grace_period = timedelta(seconds=60)
+            if parsed_time <= (now - grace_period):
+                console.print(f"[red]❌ Drop time '{time_str}' is in the past![/red]")
+                console.print(f"[yellow]Tip: Your system clock may be slow. Try a time 1+ minutes in the future.[/yellow]")
+                return
+            
+            drop_times.append(parsed_time)
+        except ValueError:
+            console.print(f"[red]❌ Invalid NameMC format: '{time_str}'[/red]")
+            console.print("[yellow]Use format: M/D/YYYY • H∶MM∶SS AM/PM[/yellow]")
+            console.print("[yellow]Example: 12/25/2024 • 3∶30∶00 PM[/yellow]")
+            return
+    
+    # Sort drop times
+    drop_times.sort()
+    
+    # Display summary
+    console.print(f"[cyan]Fallback Snipe Configuration:[/cyan]")
+    console.print(f"Username: [bold]{username}[/bold]")
+    console.print(f"Drop Windows: [bold]{len(drop_times)}[/bold]")
+    for i, dt in enumerate(drop_times, 1):
+        console.print(f"  {i}. {dt.strftime('%Y-%m-%d %H:%M:%S UTC')}")
+    
+    async def run_fallback_snipe():
+        console.print(f"[cyan]Starting fallback sniper for username: {username}[/cyan]")
+        
+        # Create and run sniper
+        sniper = UsernameSniper(app_config)
+        result = await sniper.snipe_with_fallback(drop_times, username)
+        
+        # Display results
+        if result.success:
+            console.print(Panel.fit(
+                f"SUCCESS! Claimed username '{username}' using fallback system!",
+                style="bold green"
+            ))
+        else:
+            console.print(Panel.fit(
+                f"FAILED to claim '{username}' after {len(drop_times)} drop windows.\nError: {result.error_message or 'All windows failed'}",
+                style="bold red"
+            ))
+    
+    asyncio.run(run_fallback_snipe())
 
 @cli.command()
 @click.option('--config', '-c', default='config.yaml', help='Configuration file path')

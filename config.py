@@ -30,11 +30,70 @@ class SnipeConfig:
     """Snipe configuration"""
     target_username: str = ""
     target_uuid: str = ""  # Player UUID for direct lookup
-    bearer_token: str = ""
-    start_sniping_at_seconds: int = 30
-    max_snipe_attempts: int = 100
-    request_delay_ms: int = 25
-    concurrent_requests: int = 10
+    bearer_token: str = ""  # Primary token (for backward compatibility)
+    bearer_tokens: List[str] = None  # Multiple tokens for mass sniping
+    start_sniping_at_seconds: int = 0  # Start exactly at drop time
+    max_snipe_attempts: int = 3000  # Maximum attempts for competitive edge
+    request_delay_ms: int = 8  # Ultra-fast requests
+    concurrent_requests: int = 40  # Push Oracle VPS to limits
+    
+    # Rate limiting settings
+    max_backoff_seconds: int = 5  # Maximum time to wait for rate limits
+    adaptive_delays: bool = True  # Automatically adjust delays based on rate limits
+    per_token_rate_limiting: bool = True  # Track rate limits per token
+    
+    # Internal flag to skip validation during initialization
+    _skip_validation: bool = False
+    
+    def __post_init__(self):
+        # If bearer_tokens is not set, use the single bearer_token
+        if self.bearer_tokens is None:
+            self.bearer_tokens = []
+        
+        # If we have a single bearer_token but no bearer_tokens list, add it
+        if self.bearer_token and not self.bearer_tokens:
+            self.bearer_tokens = [self.bearer_token]
+        
+        # If we have bearer_tokens but no single bearer_token, use the first one
+        if self.bearer_tokens and not self.bearer_token:
+            self.bearer_token = self.bearer_tokens[0]
+        
+        # Skip validation if this is during initialization
+        if self._skip_validation:
+            return
+            
+        # Validate we have at least one token
+        if not self.bearer_token and not self.bearer_tokens:
+            raise ValueError("At least one bearer token must be configured")
+        
+        # Remove empty tokens from the list
+        if self.bearer_tokens:
+            self.bearer_tokens = [token.strip() for token in self.bearer_tokens if token and token.strip()]
+        
+        # If bearer_tokens is empty but we have bearer_token, add it
+        if not self.bearer_tokens and self.bearer_token:
+            self.bearer_tokens = [self.bearer_token]
+        
+        # Validate token format (basic check)
+        for i, token in enumerate(self.bearer_tokens):
+            if len(token) < 50:  # Bearer tokens are typically much longer
+                print(f"⚠️ Warning: Token #{i+1} seems too short ({len(token)} chars)")
+        
+        # Validate numeric settings
+        if self.concurrent_requests <= 0:
+            raise ValueError("concurrent_requests must be greater than 0")
+        
+        if self.request_delay_ms < 0:
+            raise ValueError("request_delay_ms cannot be negative")
+        
+        if self.max_snipe_attempts <= 0:
+            raise ValueError("max_snipe_attempts must be greater than 0")
+    
+    def validate(self):
+        """Manually validate configuration after loading"""
+        # Re-run validation logic
+        self._skip_validation = False
+        self.__post_init__()
 
 @dataclass
 class NotificationSchedule:
@@ -59,20 +118,20 @@ class NotificationSchedule:
 @dataclass
 class AppConfig:
     """Main application configuration"""
+    snipe: SnipeConfig = None
     proxy: ProxyConfig = None
     discord: DiscordConfig = None
-    snipe: SnipeConfig = None
     notifications: NotificationSchedule = None
     debug_mode: bool = False
     log_level: str = "INFO"
     
     def __post_init__(self):
-        if self.proxy is None:
-            self.proxy = ProxyConfig()
+        if self.snipe is None:
+            self.snipe = SnipeConfig(_skip_validation=True)
         if self.discord is None:
             self.discord = DiscordConfig()
-        if self.snipe is None:
-            self.snipe = SnipeConfig()
+        if self.proxy is None:
+            self.proxy = ProxyConfig()
         if self.notifications is None:
             self.notifications = NotificationSchedule()
 
@@ -103,11 +162,14 @@ class ConfigManager:
                 self.config = AppConfig(
                     proxy=ProxyConfig(**proxy_data),
                     discord=DiscordConfig(**discord_data),
-                    snipe=SnipeConfig(**snipe_data),
+                    snipe=SnipeConfig(_skip_validation=True, **snipe_data),
                     notifications=NotificationSchedule(**notifications_data),
                     debug_mode=data.get('debug_mode', False),
                     log_level=data.get('log_level', 'INFO')
                 )
+                
+                # Now validate the loaded config
+                self.config.snipe.validate()
         except Exception as e:
             print(f"Error loading config: {e}")
             self.create_default_config()
