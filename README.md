@@ -390,12 +390,13 @@ For comprehensive documentation, examples, and advanced configuration:
 - 🤖 **Discord Integration** - Webhook notifications and status updates
 - 📈 **Competitive Analysis** - Success rates against different sniper types
 
-## 🫂 Authors
+## 👥 Contributors
 
-### Authors
-- **[zwroe]** -  [@zwroee](https://github.com/zwroee)
-- **[light]** - [@zerolight18](https://github.com/zerolight18)
+Thanks to these awesome people who've contributed to the project:
 
+- [@zwroee](https://github.com/zwroee) - Project creator & maintainer
+- [@zerolight18](https://github.com/zerolight18) - Co-author  
+- [@robertsmrek](https://github.com/robertsmrek) - Python 3.13 compatibility fix
 
 ## 📄 License
 
