@@ -159,6 +159,9 @@ class ConfigManager:
                 snipe_data = data.get('snipe', {})
                 notifications_data = data.get('notifications', {})
                 
+                # Remove _skip_validation from snipe_data if present
+                snipe_data.pop('_skip_validation', None)
+                
                 self.config = AppConfig(
                     proxy=ProxyConfig(**proxy_data),
                     discord=DiscordConfig(**discord_data),
@@ -180,6 +183,10 @@ class ConfigManager:
         """Save current configuration to file"""
         try:
             config_dict = asdict(self.config)
+            # Remove internal flags that shouldn't be saved
+            if 'snipe' in config_dict and '_skip_validation' in config_dict['snipe']:
+                del config_dict['snipe']['_skip_validation']
+            
             with open(self.config_path, 'w', encoding='utf-8') as f:
                 yaml.dump(config_dict, f, default_flow_style=False, indent=2)
         except Exception as e:
