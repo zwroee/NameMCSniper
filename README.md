@@ -1,12 +1,14 @@
-<div align="center">
-<img width="2188" height="740" alt="download (12)" src="https://github.com/user-attachments/assets/c9ff5adc-7f55-45e2-bad1-11ac2c397dc0" />
-</div>
+
 
 # NameMC Sniper
 
 A safe-by-default Python CLI for simulating and, only when deliberately unlocked, issuing timed Minecraft username-change requests.
 
 The default mode is a local simulation. It does not contact Minecraft, Discord, proxies, NTP, or internet time services and cannot change an account.
+
+<div align="center">
+<img width="2188" height="740" alt="download (12)" src="https://github.com/user-attachments/assets/c9ff5adc-7f55-45e2-bad1-11ac2c397dc0" />
+</div>
 
 ## Requirements
 
