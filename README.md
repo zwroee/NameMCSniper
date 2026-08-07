@@ -8,6 +8,17 @@ The default mode is a local simulation. It does not contact Minecraft, Discord, 
 
 <div align="center">
 <img width="2188" height="740" alt="download (12)" src="https://github.com/user-attachments/assets/c9ff5adc-7f55-45e2-bad1-11ac2c397dc0" />
+
+</div>
+
+<div align="center">
+
+## 🪶 Recommended Proxies
+
+[BirdProxies.com](https://www.birdproxies.com/@NAMEMCSNIPER)
+
+Get 10% off + 15% extra data using the link above!
+
 </div>
 
 ## Requirements
@@ -139,6 +150,10 @@ Without the flag and acknowledgement, non-local claim APIs are rejected before a
 
 - `max_snipe_attempts` is a global limit shared by all workers.
 - Invalid or ineligible tokens are disabled for the current window.
+- Long schedules show progress every five minutes, then every minute during the final hour and every second during the final minute.
+- The clock offset is refreshed every 30 minutes while waiting. If every external clock source is unavailable, the local system clock is used and the run continues.
+- Live token validation, connection pre-warming, process priority, and garbage-collector changes are deferred until 30 seconds before the claim window. A process-priority warning is non-fatal.
+- Bearer tokens are not automatically refreshed. Every configured token must still be valid when the claim window begins.
 - Discord notifications run outside the precision timer and have bounded timeouts.
 - Proxy credentials are redacted from logs.
 - NTP sources are queried concurrently; HTTPS time APIs are fallback sources and use round-trip midpoint correction.

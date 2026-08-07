@@ -73,6 +73,38 @@ async def test_accurate_timer_supports_virtual_time():
 
 
 @pytest.mark.asyncio
+async def test_accurate_timer_resyncs_during_long_waits():
+    class FakeSync:
+        def __init__(self):
+            self.current = datetime(2026, 1, 1, tzinfo=timezone.utc)
+            self.next_sync = self.current + timedelta(minutes=30)
+            self.sync_calls = 0
+
+        def should_resync(self):
+            return self.current >= self.next_sync
+
+        async def sync_time(self):
+            self.sync_calls += 1
+            self.next_sync = self.current + timedelta(minutes=30)
+            return True
+
+        def get_accurate_time(self):
+            return self.current
+
+    sync = FakeSync()
+
+    async def virtual_sleep(seconds):
+        sync.current += timedelta(seconds=seconds)
+        await asyncio.sleep(0)
+
+    target = sync.current + timedelta(minutes=61)
+    await AccurateTimer(sync, sleep=virtual_sleep).wait_until(target)
+
+    assert sync.current >= target
+    assert sync.sync_calls == 2
+
+
+@pytest.mark.asyncio
 async def test_timer_can_be_cancelled():
     sync = TimeSync(sync_sources=[], ntp_servers=[])
     sync.last_sync = datetime.now(timezone.utc)

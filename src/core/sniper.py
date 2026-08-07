@@ -5,6 +5,7 @@ import gc
 import hashlib
 import ipaddress
 import logging
+import math
 import os
 import statistics
 import sys
@@ -27,6 +28,7 @@ logger = logging.getLogger(__name__)
 
 LIVE_ACK_ENV = "NAMEMC_SNIPER_LIVE_ACK"
 LIVE_ACK_VALUE = "I_UNDERSTAND_THIS_CHANGES_A_REAL_ACCOUNT"
+LIVE_PREPARATION_LEAD_SECONDS = 30.0
 
 
 class RateLimitTracker:
@@ -132,7 +134,7 @@ class UsernameSniper:
         self._stop_event = asyncio.Event()
         self._notification_tasks = set()
         self._sent_notifications = set()
-        self._last_countdown_second: Optional[int] = None
+        self._last_countdown_bucket: Optional[tuple[str, int]] = None
         self._dry_run_attempts = 0
         self._connection_stats = {"requests_made": 0, "connection_errors": 0}
 
@@ -317,23 +319,47 @@ class UsernameSniper:
         self.is_running = True
         self._stop_event.clear()
         self._sent_notifications.clear()
-        self._last_countdown_second = None
+        self._last_countdown_bucket = None
         original_priority = None
         process = None
         gc_was_enabled = gc.isenabled()
 
         try:
+            lead_seconds = self.config.snipe.start_sniping_at_seconds
+            snipe_start_time = drop_time - timedelta(seconds=lead_seconds)
+
             if self.is_simulation:
                 # A dry run must never contact clock, proxy, Discord, or Minecraft services.
                 self.time_sync.time_offset = 0.0
                 self.time_sync.last_sync = datetime.now(timezone.utc)
                 logger.info("DRY RUN: all claim responses are simulated locally")
             else:
+                if self.discord_notifier:
+                    await self.discord_notifier.__aenter__()
+
+                # During a long schedule, stay low-impact while the timer refreshes
+                # its clock offset periodically. Authentication and performance
+                # changes are deliberately postponed until shortly before claims.
+                preparation_time = snipe_start_time - timedelta(seconds=LIVE_PREPARATION_LEAD_SECONDS)
+                if preparation_time > datetime.now(timezone.utc):
+                    await self.timer.wait_until(
+                        preparation_time,
+                        callback=lambda remaining, current, target: self._handle_countdown(
+                            remaining,
+                            current,
+                            drop_time,
+                            username,
+                            lead_seconds + LIVE_PREPARATION_LEAD_SECONDS,
+                        ),
+                        cancel_event=self._stop_event,
+                    )
+
                 await self._ensure_session()
                 preflight_error = await self._preflight_live_tokens()
                 if preflight_error:
                     return SnipeResult(False, username, 0, 0.0, preflight_error)
-                setup_time_remaining = (drop_time - datetime.now(timezone.utc)).total_seconds()
+
+                setup_time_remaining = (snipe_start_time - datetime.now(timezone.utc)).total_seconds()
                 sync_budget = getattr(self.time_sync, "request_timeout", 3.0) + 0.5
                 if setup_time_remaining > sync_budget:
                     await self.time_sync.sync_time()
@@ -341,8 +367,6 @@ class UsernameSniper:
                     self.time_sync.time_offset = 0.0
                     self.time_sync.last_sync = datetime.now(timezone.utc)
                     logger.warning("Skipping external clock sync because the claim window is too close")
-                if self.discord_notifier:
-                    await self.discord_notifier.__aenter__()
 
             if not self.is_simulation and self.config.performance.high_priority:
                 try:
@@ -353,7 +377,7 @@ class UsernameSniper:
                     logger.warning("Could not raise process priority: %s", exc)
 
             if not self.is_simulation and self.config.performance.pre_warm_connections:
-                setup_time_remaining = (drop_time - datetime.now(timezone.utc)).total_seconds()
+                setup_time_remaining = (snipe_start_time - datetime.now(timezone.utc)).total_seconds()
                 if setup_time_remaining > 5.5:
                     await self._prewarm_connections(min(10, self.config.snipe.concurrent_requests))
                 else:
@@ -362,8 +386,6 @@ class UsernameSniper:
             if not self.is_simulation and self.config.performance.gc_disable and gc_was_enabled:
                 gc.disable()
 
-            lead_seconds = self.config.snipe.start_sniping_at_seconds
-            snipe_start_time = drop_time - timedelta(seconds=lead_seconds)
             await self.timer.wait_until(
                 snipe_start_time,
                 callback=lambda remaining, current, target: self._handle_countdown(
@@ -429,10 +451,33 @@ class UsernameSniper:
                     self._schedule_notification(self._send_countdown_notification(interval, drop_time, username))
                 break
 
-        whole_second = int(time_until_drop)
-        if whole_second != self._last_countdown_second and time_until_drop <= 60:
-            self._last_countdown_second = whole_second
+        if time_until_drop <= 60:
+            countdown_bucket = ("second", int(time_until_drop))
+        elif time_until_drop <= 3600:
+            countdown_bucket = ("minute", math.ceil(time_until_drop / 60))
+        else:
+            countdown_bucket = ("five_minutes", math.ceil(time_until_drop / 300))
+
+        if countdown_bucket == self._last_countdown_bucket:
+            return
+        self._last_countdown_bucket = countdown_bucket
+
+        if time_until_drop <= 60:
             logger.info("Starting in %.1f seconds (UTC %s)", time_until_drop, current_time.strftime("%H:%M:%S.%f")[:-3])
+        else:
+            total_seconds = max(0, math.ceil(time_until_drop))
+            days, remainder = divmod(total_seconds, 86400)
+            hours, remainder = divmod(remainder, 3600)
+            minutes, seconds = divmod(remainder, 60)
+            pieces = []
+            if days:
+                pieces.append(f"{days}d")
+            if hours or days:
+                pieces.append(f"{hours}h")
+            pieces.append(f"{minutes}m")
+            if not days and not hours:
+                pieces.append(f"{seconds}s")
+            logger.info("Drop in %s (UTC %s)", " ".join(pieces), current_time.strftime("%H:%M:%S"))
 
     async def _send_countdown_notification(self, seconds_remaining: int, drop_time: datetime, username: str) -> None:
         if not self.discord_notifier:

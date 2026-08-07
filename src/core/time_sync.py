@@ -185,13 +185,16 @@ class AccurateTimer:
     ) -> None:
         if target_time.tzinfo is None:
             raise ValueError("target_time must be timezone-aware")
-        if self.time_sync.should_resync():
-            await self.time_sync.sync_time()
-
         busy_wait_seconds = max(0, busy_wait_ms) / 1000.0
         while True:
             if cancel_event and cancel_event.is_set():
                 raise asyncio.CancelledError("Timer cancelled")
+
+            # Long-running schedules must not keep using the offset measured
+            # when the command first started. TimeSync applies its own interval,
+            # so this is cheap between the periodic refreshes.
+            if self.time_sync.should_resync():
+                await self.time_sync.sync_time()
 
             current_time = self.time_sync.get_accurate_time()
             remaining = (target_time - current_time).total_seconds()

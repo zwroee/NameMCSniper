@@ -1,10 +1,18 @@
 import asyncio
-from datetime import datetime, timezone
+import logging
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from src.config.config import AppConfig
-from src.core.sniper import LIVE_ACK_ENV, LIVE_ACK_VALUE, RateLimitTracker, UsernameSniper
+from src.core.sniper import (
+    LIVE_ACK_ENV,
+    LIVE_ACK_VALUE,
+    LIVE_PREPARATION_LEAD_SECONDS,
+    RateLimitTracker,
+    SnipeResult,
+    UsernameSniper,
+)
 
 
 def make_config(**snipe_overrides):
@@ -134,6 +142,79 @@ async def test_fallback_aggregates_attempts():
         assert result.attempts == 4
     finally:
         await sniper.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_live_preparation_is_deferred_until_shortly_before_claiming(monkeypatch):
+    config = make_config(
+        dry_run=False,
+        bearer_token="x" * 60,
+        timezone_name="UTC",
+        api_base_url="http://127.0.0.1:1",
+    )
+    config.performance.pre_warm_connections = True
+    sniper = UsernameSniper(config)
+    events = []
+    waits = []
+
+    class RecordingTimer:
+        async def wait_until(self, target, **kwargs):
+            waits.append(target)
+            events.append("wait")
+
+    async def ensure_session():
+        events.append("session")
+        return object()
+
+    async def preflight():
+        events.append("preflight")
+        return None
+
+    async def sync_time():
+        events.append("sync")
+        return True
+
+    async def prewarm(_count):
+        events.append("prewarm")
+
+    async def start_sniping(_username):
+        events.append("start")
+        return SnipeResult(True, "TestName", 1, 0.01)
+
+    sniper.timer = RecordingTimer()
+    monkeypatch.setattr(sniper, "_ensure_session", ensure_session)
+    monkeypatch.setattr(sniper, "_preflight_live_tokens", preflight)
+    monkeypatch.setattr(sniper.time_sync, "sync_time", sync_time)
+    monkeypatch.setattr(sniper, "_prewarm_connections", prewarm)
+    monkeypatch.setattr(sniper, "_start_sniping", start_sniping)
+
+    drop_time = datetime.now(timezone.utc) + timedelta(hours=2)
+    try:
+        result = await sniper.snipe_at_time(drop_time, "TestName")
+    finally:
+        await sniper.cleanup()
+
+    assert result.success is True
+    assert waits == [
+        drop_time - timedelta(seconds=LIVE_PREPARATION_LEAD_SECONDS),
+        drop_time,
+    ]
+    assert events == ["wait", "session", "preflight", "sync", "prewarm", "wait", "start"]
+
+
+@pytest.mark.asyncio
+async def test_long_countdown_reports_progress_without_log_spam(caplog):
+    sniper = UsernameSniper(make_config())
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    caplog.set_level(logging.INFO, logger="src.core.sniper")
+
+    await sniper._handle_countdown(7200, now, now + timedelta(hours=2), "TestName", 0)
+    await sniper._handle_countdown(7100, now, now + timedelta(hours=2), "TestName", 0)
+    await sniper._handle_countdown(6899, now, now + timedelta(hours=2), "TestName", 0)
+
+    progress = [record.message for record in caplog.records if record.message.startswith("Drop in")]
+    assert len(progress) == 2
+    assert "2h 0m" in progress[0]
 
 
 def test_rate_limit_tracker_uses_monotonic_backoff_and_disabling():
