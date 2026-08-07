@@ -1,543 +1,497 @@
+"""Safe, testable Minecraft username claim orchestration."""
+
 import asyncio
-import aiohttp
-import time
-import logging
 import gc
-import psutil
-import sys
+import hashlib
+import ipaddress
+import logging
 import os
 import statistics
-from datetime import datetime, timezone, timedelta
-from typing import Optional, List, Dict, Any, Set, Union
-from dataclasses import dataclass
-
-from src.notifications.discord_notifier import DiscordNotifier
-from src.config.config import AppConfig
-from src.core.time_sync import TimeSync, AccurateTimer
+import sys
+import time
 from collections import defaultdict
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from typing import Any, Awaitable, Callable, Dict, List, Optional
+from urllib.parse import urlparse
+
+import aiohttp
+import psutil
+
+from src.config.config import USERNAME_RE, AppConfig
+from src.core.time_sync import AccurateTimer, TimeSync
+from src.network.proxy_manager import ProxyManager, redact_proxy_url
+from src.notifications.discord_notifier import DiscordNotifier
 
 logger = logging.getLogger(__name__)
 
+LIVE_ACK_ENV = "NAMEMC_SNIPER_LIVE_ACK"
+LIVE_ACK_VALUE = "I_UNDERSTAND_THIS_CHANGES_A_REAL_ACCOUNT"
+
+
 class RateLimitTracker:
-    """Track rate limits per token to optimize request distribution"""
-    
-    def __init__(self):
-        self.token_limits = defaultdict(lambda: {'last_limited': 0, 'backoff_until': 0})
-    
+    """Track rate limits without retaining or logging token fragments."""
+
+    def __init__(self, monotonic: Callable[[], float] = time.monotonic):
+        self._monotonic = monotonic
+        self.token_limits = defaultdict(lambda: {"last_limited": 0.0, "backoff_until": 0.0})
+        self.disabled_tokens = set()
+
+    @staticmethod
+    def _key(token: str) -> str:
+        return hashlib.sha256((token or "default").encode("utf-8")).hexdigest()
+
+    def disable_token(self, token: str) -> None:
+        self.disabled_tokens.add(self._key(token))
+
+    def is_token_disabled(self, token: str) -> bool:
+        return self._key(token) in self.disabled_tokens
+
     def is_token_limited(self, token: str) -> bool:
-        """Check if a token is currently rate limited"""
-        token_key = token[-8:] if token else "default"
-        return time.time() < self.token_limits[token_key]['backoff_until']
-    
-    def record_rate_limit(self, token: str, retry_after: float):
-        """Record a rate limit for a token"""
-        token_key = token[-8:] if token else "default"
-        self.token_limits[token_key]['last_limited'] = time.time()
-        self.token_limits[token_key]['backoff_until'] = time.time() + retry_after
-        logger.debug(f"Token ...{token_key} rate limited until {self.token_limits[token_key]['backoff_until']}")
+        return self._monotonic() < self.token_limits[self._key(token)]["backoff_until"]
+
+    def record_rate_limit(self, token: str, retry_after: float) -> None:
+        key = self._key(token)
+        now = self._monotonic()
+        self.token_limits[key]["last_limited"] = now
+        self.token_limits[key]["backoff_until"] = now + max(0.0, retry_after)
 
     def seconds_until_available(self, token: str) -> float:
-        """Return seconds remaining before a token can be tried again."""
-        token_key = token[-8:] if token else "default"
-        return max(0.0, self.token_limits[token_key]['backoff_until'] - time.time())
-    
-    def get_best_token(self, tokens: list) -> str:
-        """Get the token with the least recent rate limiting"""
-        if not tokens:
+        return max(0.0, self.token_limits[self._key(token)]["backoff_until"] - self._monotonic())
+
+    def get_best_token(self, tokens: List[str]) -> Optional[str]:
+        enabled = [token for token in tokens if not self.is_token_disabled(token)]
+        if not enabled:
             return None
-        
-        # Filter out currently rate limited tokens
-        available_tokens = [t for t in tokens if not self.is_token_limited(t)]
-        
-        if not available_tokens:
-            # All tokens are rate limited, return the one that recovers soonest
-            return min(tokens, key=lambda t: self.token_limits[t[-8:]]['backoff_until'])
-        
-        # Return token with oldest rate limit (or never limited)
-        return min(available_tokens, key=lambda t: self.token_limits[t[-8:]]['last_limited'])
+        available = [token for token in enabled if not self.is_token_limited(token)]
+        candidates = available or enabled
+        return min(
+            candidates,
+            key=lambda token: (
+                self.token_limits[self._key(token)]["backoff_until"],
+                self.token_limits[self._key(token)]["last_limited"],
+            ),
+        )
+
+
+class AttemptBudget:
+    """A global attempt counter shared by every worker."""
+
+    def __init__(self, limit: int):
+        self.limit = limit
+        self.used = 0
+        self._lock = asyncio.Lock()
+
+    async def reserve(self) -> bool:
+        async with self._lock:
+            if self.used >= self.limit:
+                return False
+            self.used += 1
+            return True
+
 
 @dataclass
 class SnipeResult:
-    """Result of a snipe attempt"""
     success: bool
     username: str
     attempts: int
     total_time: float
     error_message: Optional[str] = None
 
+
+ClaimHandler = Callable[[str, str], Awaitable[Dict[str, Any]]]
+
+
 class UsernameSniper:
-    """Simple username sniper - countdown and claim"""
-    
-    def __init__(self, config: AppConfig):
+    def __init__(
+        self,
+        config: AppConfig,
+        *,
+        claim_handler: Optional[ClaimHandler] = None,
+        time_sync: Optional[TimeSync] = None,
+        timer: Optional[AccurateTimer] = None,
+        notifier: Optional[DiscordNotifier] = None,
+        live_requested: bool = False,
+        monotonic: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    ):
         self.config = config
-        self.discord_notifier = None
-        self.session = None
-        self._session_connector = None
-        self.proxy_manager = None
+        self._claim_handler = claim_handler
+        self._live_requested = live_requested
+        self._monotonic = monotonic
+        self._sleep = sleep
+        self.time_sync = time_sync or TimeSync()
+        self.timer = timer or AccurateTimer(self.time_sync, sleep=sleep)
+        self.rate_limit_tracker = RateLimitTracker(monotonic=monotonic)
+
+        self.session: Optional[aiohttp.ClientSession] = None
+        self._session_connector: Optional[aiohttp.TCPConnector] = None
+        self.proxy_manager: Optional[ProxyManager] = None
+        self.discord_notifier: Optional[DiscordNotifier] = notifier
         self.is_running = False
-        
-        # Initialize time synchronization
-        self.time_sync = TimeSync()
-        self.timer = AccurateTimer(self.time_sync)
-        
-        # Initialize rate limiting tracker
-        self.rate_limit_tracker = RateLimitTracker()
-        
-        # Track sent notifications to prevent duplicates
-        self.sent_notifications = set()
-        
-        # Connection pooling stats
-        self._connection_stats = {
-            'requests_made': 0,
-            'connections_reused': 0,
-            'connection_errors': 0
-        }
-        
-        # Initialize proxy manager if enabled
-        if self.config.proxy.enabled and self.config.proxy.proxies:
-            try:
-                from src.network.proxy_manager import ProxyManager
-                self.proxy_manager = ProxyManager(
-                    proxy_list=self.config.proxy.proxies,
-                    rotation_enabled=self.config.proxy.rotation_enabled,
-                    timeout=self.config.proxy.timeout
-                )
-                logger.info("Proxy manager initialized successfully")
-            except Exception as e:
-                logger.error(f"Failed to initialize proxy manager: {e}")
-                logger.warning("Continuing without proxy support")
-                self.proxy_manager = None
-        
-        # Initialize Discord notifier if enabled
-        if self.config.discord.enabled and self.config.discord.webhook_url:
+        self._stop_event = asyncio.Event()
+        self._notification_tasks = set()
+        self._sent_notifications = set()
+        self._last_countdown_second: Optional[int] = None
+        self._dry_run_attempts = 0
+        self._connection_stats = {"requests_made": 0, "connection_errors": 0}
+
+        simulation = self.config.snipe.dry_run or self._claim_handler is not None
+        if not simulation and self.config.proxy.enabled and self.config.proxy.proxies:
+            self.proxy_manager = ProxyManager(
+                proxy_list=self.config.proxy.proxies,
+                rotation_enabled=self.config.proxy.rotation_enabled,
+                timeout=self.config.proxy.timeout,
+                max_retries=self.config.proxy.max_retries,
+            )
+        if (
+            not simulation
+            and self.discord_notifier is None
+            and self.config.discord.enabled
+            and self.config.discord.webhook_url
+        ):
             self.discord_notifier = DiscordNotifier(
                 webhook_url=self.config.discord.webhook_url,
                 mention_role_id=self.config.discord.mention_role_id,
-                embed_color=self.config.discord.embed_color
+                embed_color=self.config.discord.embed_color,
             )
-    
+
+    @property
+    def is_simulation(self) -> bool:
+        return self.config.snipe.dry_run or self._claim_handler is not None
+
+    async def __aenter__(self) -> "UsernameSniper":
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
+        await self.cleanup()
+
+    def stop(self) -> None:
+        """Request cancellation from signal handlers or UI code."""
+        self._stop_event.set()
+
+    def _assert_safe_transport(self) -> None:
+        if self.is_simulation:
+            return
+        host = (urlparse(self.config.snipe.api_base_url).hostname or "").lower()
+        is_local = host == "localhost"
+        if not is_local:
+            try:
+                is_local = ipaddress.ip_address(host).is_loopback
+            except ValueError:
+                is_local = False
+        if not is_local:
+            if not self._live_requested:
+                raise RuntimeError("Live network claims are locked. The command must include --live.")
+            if os.environ.get(LIVE_ACK_ENV) != LIVE_ACK_VALUE:
+                raise RuntimeError(
+                    "Live network claims are locked. Set "
+                    f"{LIVE_ACK_ENV}={LIVE_ACK_VALUE} only when you intentionally want to change a real account."
+                )
+
     async def _ensure_session(self) -> aiohttp.ClientSession:
-        """Ensure HTTP session exists with connection pooling"""
+        self._assert_safe_transport()
         if self.session is None or self.session.closed:
-            # Create optimized TCP connector for connection pooling
+            connection_limit = min(500, max(20, self.config.snipe.concurrent_requests * 2))
             self._session_connector = aiohttp.TCPConnector(
-                limit=500,  # Max total connections
-                limit_per_host=100,  # Max connections per host
-                ttl_dns_cache=300,  # Cache DNS for 5 minutes
+                limit=connection_limit,
+                limit_per_host=connection_limit,
+                ttl_dns_cache=300,
                 use_dns_cache=True,
-                keepalive_timeout=30,  # Keep connections alive for 30s
-                enable_cleanup_closed=True,
-                force_close=False  # Reuse connections
+                keepalive_timeout=30,
             )
-            
-            timeout_seconds = self.config.proxy.timeout if self.proxy_manager else 5
-            timeout = aiohttp.ClientTimeout(
-                total=timeout_seconds,
-                connect=2,  # Fast connection timeout
-                sock_read=timeout_seconds
-            )
-            
+            total_timeout = self.config.proxy.timeout if self.proxy_manager else 5.0
             self.session = aiohttp.ClientSession(
                 connector=self._session_connector,
-                timeout=timeout,
-                # Optimize headers
-                headers={
-                    'User-Agent': 'MinecraftSniper/2.0',
-                    'Accept': 'application/json',
-                    'Connection': 'keep-alive'
-                }
+                timeout=aiohttp.ClientTimeout(total=total_timeout, connect=min(2.0, total_timeout)),
+                headers={"User-Agent": "NameMCSniper/3.0", "Accept": "application/json"},
             )
-            logger.info("🔌 HTTP session created with connection pooling enabled")
-        
         return self.session
-    
-    async def _prewarm_connections(self, num_connections: int = 5):
-        """Pre-warm connections to Minecraft API"""
-        logger.info(f"🔥 Pre-warming {num_connections} connections to Minecraft API...")
+
+    async def _prewarm_connections(self, num_connections: int = 5) -> None:
+        if self.is_simulation or self.proxy_manager:
+            return
         session = await self._ensure_session()
-        
-        # Make lightweight requests to establish connections
-        tasks = []
-        for i in range(num_connections):
-            # Use a lightweight endpoint
-            task = self._prewarm_single_connection(session, i)
-            tasks.append(task)
-        
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        successful = sum(1 for r in results if not isinstance(r, Exception))
-        logger.info(f"✅ Pre-warmed {successful}/{num_connections} connections")
-    
-    async def _prewarm_single_connection(self, session: aiohttp.ClientSession, index: int):
-        """Pre-warm a single connection"""
-        try:
-            url = "https://api.minecraftservices.com/minecraft/profile/name/availability/check/TestPrewarm"
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=2)) as resp:
-                await resp.read()  # Consume response to complete connection
-                logger.debug(f"Pre-warmed connection {index+1}")
-        except Exception as e:
-            logger.debug(f"Pre-warm connection {index+1} failed: {e}")
-            raise
-    
-    async def cleanup(self):
-        """Cleanup resources properly"""
-        logger.info("🧹 Cleaning up resources...")
-        
-        # Log connection stats
-        if self._connection_stats['requests_made'] > 0:
-            reuse_rate = (self._connection_stats['connections_reused'] / 
-                         self._connection_stats['requests_made'] * 100)
-            logger.info(f"📊 Connection reuse rate: {reuse_rate:.1f}%")
-        
-        # Close HTTP session
+        token = self.config.snipe.bearer_token
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        url = f"{self.config.snipe.api_base_url}/minecraft/profile"
+
+        async def prewarm() -> bool:
+            try:
+                async with session.get(url, headers=headers) as response:
+                    await response.read()
+                return True
+            except Exception as exc:
+                logger.debug("Connection pre-warm failed: %s", exc)
+                return False
+
+        results = await asyncio.gather(*(prewarm() for _ in range(max(1, num_connections))))
+        logger.info("Pre-warmed %s/%s connections", sum(results), len(results))
+
+    async def _preflight_live_tokens(self) -> Optional[str]:
+        """Reject unusable live accounts before sending any claim requests."""
+        if self.is_simulation:
+            return None
+
+        session = await self._ensure_session()
+        url = f"{self.config.snipe.api_base_url}/minecraft/profile"
+
+        async def check(token: str) -> tuple[str, int | str]:
+            headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+            try:
+                async with session.get(url, headers=headers) as response:
+                    await response.read()
+                    return token, response.status
+            except asyncio.TimeoutError:
+                return token, "timeout"
+            except aiohttp.ClientError:
+                return token, "network_error"
+
+        results = await asyncio.gather(*(check(token) for token in self.config.snipe.bearer_tokens))
+        valid_tokens = [token for token, status in results if status == 200]
+        for token, status in results:
+            if status in {401, 403, 404}:
+                self.rate_limit_tracker.disable_token(token)
+
+        if valid_tokens:
+            rejected = len(results) - len(valid_tokens)
+            if rejected:
+                logger.warning("Live preflight rejected %s unusable token(s)", rejected)
+            return None
+
+        statuses = {status for _, status in results}
+        if 404 in statuses:
+            return "Authenticated account has no Minecraft Java profile and cannot rename a Java username"
+        if 401 in statuses:
+            return "All bearer tokens are invalid or expired"
+        if 403 in statuses:
+            return "All authenticated accounts were rejected or are ineligible"
+        if 429 in statuses:
+            return "Minecraft rate-limited the account preflight; wait before trying again"
+        return "Unable to verify a usable Minecraft Java profile before the live claim"
+
+    async def cleanup(self) -> None:
+        self.stop()
+        if self._notification_tasks:
+            await asyncio.gather(*list(self._notification_tasks), return_exceptions=True)
         if self.session and not self.session.closed:
             await self.session.close()
-            logger.info("HTTP session closed")
-        
-        # Close connector
-        if self._session_connector and not self._session_connector.closed:
-            await self._session_connector.close()
-            logger.info("TCP connector closed")
-        
-        # Close Discord notifier
+        self.session = None
+        self._session_connector = None
         if self.discord_notifier:
-            try:
-                await self.discord_notifier.__aexit__(None, None, None)
-            except Exception as e:
-                logger.warning(f"Error closing Discord notifier: {e}")
-    
+            await self.discord_notifier.close()
+
     async def snipe_with_fallback(self, drop_times: List[datetime], username: str) -> SnipeResult:
-        """Snipe a username with multiple fallback drop times"""
         if not drop_times:
-            logger.error("No drop times provided")
-            return SnipeResult(
-                success=False,
-                username=username,
-                attempts=0,
-                total_time=0,
-                error_message="No drop times provided"
-            )
-        
-        logger.info(f"Starting fallback sniper for username: {username}")
-        logger.info(f"Drop times: {[dt.isoformat() for dt in drop_times]}")
-        
-        # Try each drop time in order
-        for i, drop_time in enumerate(drop_times, 1):
-            logger.info(f"🎯 Attempting drop window {i}/{len(drop_times)}: {drop_time.isoformat()}")
-            
-            if self.discord_notifier:
-                try:
-                    await self.discord_notifier.notify_status_update(
-                        f"🎯 **Drop Window {i}/{len(drop_times)}**\n"
-                        f"Username: **{username}**\n"
-                        f"Drop time: {drop_time.strftime('%Y-%m-%d %H:%M:%S UTC')}"
-                    )
-                except Exception as e:
-                    logger.warning(f"Failed to send fallback window notification: {e}")
-            
+            return SnipeResult(False, username, 0, 0.0, "No drop times provided")
+
+        total_attempts = 0
+        started = self._monotonic()
+        last_error = "All drop windows failed"
+        for drop_time in sorted(drop_times):
+            if self._stop_event.is_set():
+                last_error = "Cancelled"
+                break
             result = await self.snipe_at_time(drop_time, username)
-            
+            total_attempts += result.attempts
             if result.success:
-                logger.info(f"🎉 SUCCESS on drop window {i}!")
+                result.attempts = total_attempts
+                result.total_time = self._monotonic() - started
                 return result
-            else:
-                logger.warning(f"❌ Drop window {i} failed: {result.error_message}")
-                
-                # If there are more drop times, wait a bit before next attempt
-                if i < len(drop_times):
-                    logger.info(f"⏳ Preparing for next drop window in 5 seconds...")
-                    await asyncio.sleep(5)
-        
-        # All drop windows failed
-        logger.error(f"❌ All {len(drop_times)} drop windows failed for {username}")
-        return SnipeResult(
-            success=False,
-            username=username,
-            attempts=0,
-            total_time=0,
-            error_message=f"All {len(drop_times)} drop windows failed"
-        )
+            last_error = result.error_message or last_error
+
+        return SnipeResult(False, username, total_attempts, self._monotonic() - started, last_error)
 
     async def snipe_at_time(self, drop_time: datetime, username: str) -> SnipeResult:
-        """Snipe a username at the specified time"""
         if self.is_running:
-            logger.warning("Sniper is already running")
-            return SnipeResult(
-                success=False,
-                username=username,
-                attempts=0,
-                total_time=0,
-                error_message="Sniper already running"
-            )
-        
+            return SnipeResult(False, username, 0, 0.0, "Sniper already running")
+        if drop_time.tzinfo is None:
+            return SnipeResult(False, username, 0, 0.0, "Drop time must be timezone-aware")
+        if not USERNAME_RE.fullmatch(username):
+            return SnipeResult(False, username, 0, 0.0, "Username must be 3-16 letters, digits, or underscores")
+
+        self._assert_safe_transport()
+        if not self.is_simulation and not self.config.snipe.bearer_tokens:
+            return SnipeResult(False, username, 0, 0.0, "No bearer tokens configured")
+
         self.is_running = True
-        # Reset notification tracking for new snipe
-        self.sent_notifications.clear()
-        
-        logger.info(f"Starting sniper for username: {username}")
-        logger.info(f"Drop time: {drop_time.isoformat()}")
-        
+        self._stop_event.clear()
+        self._sent_notifications.clear()
+        self._last_countdown_second = None
+        original_priority = None
+        process = None
+        gc_was_enabled = gc.isenabled()
+
         try:
-            # Check bearer token
-            if not self.config.snipe.bearer_token or self.config.snipe.bearer_token == "your_minecraft_bearer_token_here":
-                logger.error("Bearer token not configured!")
-                return SnipeResult(
-                    success=False,
-                    username=username,
-                    attempts=0,
-                    total_time=0,
-                    error_message="Bearer token not configured"
-                )
-            
-            
-            # Ensure persistent HTTP session exists (reuses connections)
-            await self._ensure_session()
-            logger.info("✅ Using persistent HTTP session with connection pooling")
-            
-            if self.proxy_manager:
-                logger.info(f"Proxy support enabled with {len(self.config.proxy.proxies)} proxies")
+            if self.is_simulation:
+                # A dry run must never contact clock, proxy, Discord, or Minecraft services.
+                self.time_sync.time_offset = 0.0
+                self.time_sync.last_sync = datetime.now(timezone.utc)
+                logger.info("DRY RUN: all claim responses are simulated locally")
             else:
-                logger.info("Using direct connection (no proxies configured)")
-            
-            # Initialize Discord session
-            if self.discord_notifier:
-                await self.discord_notifier.__aenter__()
-            
-            # Send Discord notification
-            if self.discord_notifier:
-                try:
-                    await self.discord_notifier.notify_status_update(
-                        f"🎯 Started sniper for **{username}**\n"
-                        f"Drop time: {drop_time.strftime('%Y-%m-%d %H:%M:%S UTC')}\n"
-                        f"Will start sniping 0.1 seconds before drop time"
-                    )
-                except Exception as e:
-                    logger.warning(f"Failed to send Discord notification: {e}")
-            
-            # Sync time first
-            await self.time_sync.sync_time()
-            
-            # Wait until snipe time with accurate timer (start 0.4s early for competitive edge)
-            snipe_start_time = drop_time - timedelta(milliseconds=400)
-            
-            # Application Performance Tuning
-            if self.config.performance.high_priority:
-                try:
-                    p = psutil.Process(os.getpid())
-                    if sys.platform == "win32":
-                        p.nice(psutil.HIGH_PRIORITY_CLASS)
-                        logger.info("🚀 Process priority set to HIGH")
-                    else:
-                        p.nice(-10)  # Unix nice value (requires root)
-                        logger.info("🚀 Process priority set to HIGH (nice -10)")
-                except (PermissionError, psutil.AccessDenied):
-                    logger.warning(
-                        "⚠️ Could not set high process priority (requires root on Linux). "
-                        "The sniper will continue normally — this is non-fatal. "
-                        "To enable it, run the sniper with: sudo python menu.py"
-                    )
-                except Exception as e:
-                    logger.warning(f"Failed to set process priority: {e}")
+                await self._ensure_session()
+                preflight_error = await self._preflight_live_tokens()
+                if preflight_error:
+                    return SnipeResult(False, username, 0, 0.0, preflight_error)
+                setup_time_remaining = (drop_time - datetime.now(timezone.utc)).total_seconds()
+                sync_budget = getattr(self.time_sync, "request_timeout", 3.0) + 0.5
+                if setup_time_remaining > sync_budget:
+                    await self.time_sync.sync_time()
+                else:
+                    self.time_sync.time_offset = 0.0
+                    self.time_sync.last_sync = datetime.now(timezone.utc)
+                    logger.warning("Skipping external clock sync because the claim window is too close")
+                if self.discord_notifier:
+                    await self.discord_notifier.__aenter__()
 
-            # Connection Pre-warming
-            if self.config.performance.pre_warm_connections:
+            if not self.is_simulation and self.config.performance.high_priority:
                 try:
-                    await self._prewarm_connections(num_connections=10)
-                except Exception as e:
-                    logger.warning(f"Connection pre-warming failed (continuing anyway): {e}")
+                    process = psutil.Process(os.getpid())
+                    original_priority = process.nice()
+                    process.nice(psutil.HIGH_PRIORITY_CLASS if sys.platform == "win32" else -10)
+                except (PermissionError, psutil.AccessDenied, OSError) as exc:
+                    logger.warning("Could not raise process priority: %s", exc)
 
-            # Disable Garbage Collection
-            if self.config.performance.gc_disable:
+            if not self.is_simulation and self.config.performance.pre_warm_connections:
+                setup_time_remaining = (drop_time - datetime.now(timezone.utc)).total_seconds()
+                if setup_time_remaining > 5.5:
+                    await self._prewarm_connections(min(10, self.config.snipe.concurrent_requests))
+                else:
+                    logger.warning("Skipping connection pre-warm because the claim window is too close")
+
+            if not self.is_simulation and self.config.performance.gc_disable and gc_was_enabled:
                 gc.disable()
-                logger.info("🗑️ Garbage collection disabled for critical window")
 
+            lead_seconds = self.config.snipe.start_sniping_at_seconds
+            snipe_start_time = drop_time - timedelta(seconds=lead_seconds)
             await self.timer.wait_until(
-                snipe_start_time, 
-                callback=lambda remaining, current, target: self._handle_countdown(remaining, current, target, username),
-                busy_wait_ms=self.config.performance.busy_wait_ms
+                snipe_start_time,
+                callback=lambda remaining, current, target: self._handle_countdown(
+                    remaining, current, drop_time, username, lead_seconds
+                ),
+                busy_wait_ms=0 if self.is_simulation else self.config.performance.busy_wait_ms,
+                cancel_event=self._stop_event,
             )
-            
-            # Start sniping
             result = await self._start_sniping(username)
-            
-            # Send final notification
             if self.discord_notifier:
-                try:
-                    await self.discord_notifier.notify_snipe_result(
+                self._schedule_notification(
+                    self.discord_notifier.notify_snipe_result(
                         username=result.username,
                         success=result.success,
                         attempts=result.attempts,
-                        response_time=0,
-                        error_message=result.error_message
+                        error_message=result.error_message,
                     )
-                except Exception as e:
-                    logger.warning(f"Failed to send final Discord notification: {e}")
-            
+                )
             return result
-        
-        except Exception as e:
-            logger.error(f"Error in sniper: {e}")
-            return SnipeResult(
-                success=False,
-                username=username,
-                attempts=0,
-                total_time=0,
-                error_message=str(e)
-            )
+        except asyncio.CancelledError:
+            return SnipeResult(False, username, 0, 0.0, "Cancelled")
+        except Exception as exc:
+            logger.error("Sniper failed: %s", exc)
+            return SnipeResult(False, username, 0, 0.0, str(exc))
         finally:
             self.is_running = False
-            
-            # Re-enable Garbage Collection
-            if self.config.performance.gc_disable:
+            if self.config.performance.gc_disable and gc_was_enabled and not gc.isenabled():
                 gc.enable()
-                logger.info("🗑️ Garbage collection re-enabled")
-            
-            # Note: Session is kept alive for reuse across snipes
-            # Call cleanup() explicitly when done with all snipes
-            if self.discord_notifier:
+            if process is not None and original_priority is not None:
                 try:
-                    await self.discord_notifier.close()
-                except Exception as e:
-                    logger.debug(f"Discord notifier already closed: {e}")
-    
-    async def _handle_countdown(self, time_remaining: float, current_time: datetime, target_time: datetime, username: str):
-        """Handle countdown notifications with accurate timing"""
-        # Notification intervals (in seconds) - more precise timing
-        notification_intervals = [3600, 1800, 600, 300, 60, 30, 10, 5, 1]  # 1h, 30m, 10m, 5m, 1m, 30s, 10s, 5s, 1s
-        
-        # Check if we should send a notification
-        for interval in notification_intervals:
-            # Check if we're within 0.5 seconds of the notification time
-            if abs(time_remaining - interval) <= 0.5 and interval not in self.sent_notifications:
-                self.sent_notifications.add(interval)
-                await self._send_countdown_notification(interval, target_time, username)
+                    process.nice(original_priority)
+                except (psutil.Error, OSError):
+                    logger.debug("Could not restore process priority")
+
+    def _schedule_notification(self, awaitable: Awaitable[Any]) -> None:
+        task = asyncio.create_task(awaitable)
+        self._notification_tasks.add(task)
+
+        def notification_done(completed: asyncio.Task) -> None:
+            self._notification_tasks.discard(completed)
+            try:
+                error = completed.exception()
+            except asyncio.CancelledError:
+                return
+            if error:
+                logger.warning("Notification failed: %s", error)
+
+        task.add_done_callback(notification_done)
+
+    async def _handle_countdown(
+        self,
+        time_until_start: float,
+        current_time: datetime,
+        drop_time: datetime,
+        username: str,
+        lead_seconds: float,
+    ) -> None:
+        time_until_drop = max(0.0, time_until_start + lead_seconds)
+        for interval in self.config.notifications.intervals:
+            if abs(time_until_drop - interval) <= 0.55 and interval not in self._sent_notifications:
+                self._sent_notifications.add(interval)
+                if self.discord_notifier:
+                    self._schedule_notification(self._send_countdown_notification(interval, drop_time, username))
                 break
-        
-        # Show console countdown for last 60 seconds
-        if time_remaining <= 60:
-            logger.info(f"🚨 Starting in {time_remaining:.1f} seconds... (Accurate time: {current_time.strftime('%H:%M:%S.%f')[:-3]})")
-        elif time_remaining <= 600:  # Last 10 minutes
-            logger.info(f"⏰ {time_remaining:.0f} seconds remaining...")
-    
-    async def _send_countdown_notification(self, seconds_remaining: int, drop_time: datetime, username: str):
-        """Send Discord countdown notification"""
+
+        whole_second = int(time_until_drop)
+        if whole_second != self._last_countdown_second and time_until_drop <= 60:
+            self._last_countdown_second = whole_second
+            logger.info("Starting in %.1f seconds (UTC %s)", time_until_drop, current_time.strftime("%H:%M:%S.%f")[:-3])
+
+    async def _send_countdown_notification(self, seconds_remaining: int, drop_time: datetime, username: str) -> None:
         if not self.discord_notifier:
             return
-        
-        # Format time remaining
         if seconds_remaining >= 3600:
             time_str = f"{seconds_remaining // 3600} hour(s)"
         elif seconds_remaining >= 60:
             time_str = f"{seconds_remaining // 60} minute(s)"
         else:
             time_str = f"{seconds_remaining} second(s)"
-        
-        try:
-            await self.discord_notifier.notify_drop_countdown(
-                username=username,
-                time_remaining=time_str,
-                drop_time=drop_time
-            )
-            logger.info(f"📢 Sent countdown notification: {time_str} remaining")
-        except Exception as e:
-            logger.warning(f"Failed to send countdown notification: {e}")
-    
-    async def _start_sniping(self, username: str) -> SnipeResult:
-        """Start the sniping process with dynamic concurrency adjustment"""
-        logger.info("🚨 Starting sniping process!")
-        
-        start_time = time.time()
-        stop_time = start_time + 10.1  # Snipe for 10.1 seconds
-        attempts = 0
-        success = False
-        
-        # Validate we have tokens
-        tokens = self.config.snipe.bearer_tokens
-        if not tokens:
-            logger.error("❌ No bearer tokens configured! Check your config.yaml")
-            return SnipeResult(
-                success=False,
-                username=username,
-                attempts=0,
-                total_time=0.0,
-                error_message="No bearer tokens configured"
-            )
-        
-        # Dynamic concurrency: start with configured amount
-        worker_count = max(1, self.config.snipe.concurrent_requests)
-        max_attempts = max(0, self.config.snipe.max_snipe_attempts)
-        per_worker_limit = None
-        if max_attempts:
-            per_worker_limit = max(1, (max_attempts + worker_count - 1) // worker_count)
+        await self.discord_notifier.notify_drop_countdown(username, time_str, drop_time)
 
-        logger.info(
-            f"🔥 Starting with {len(tokens)} token(s), {worker_count} workers"
-            + (f", max {max_attempts} attempts" if max_attempts else "")
-        )
-        
-        # Create workers - distributed across multiple tokens
+    async def _start_sniping(self, username: str) -> SnipeResult:
+        tokens = self.config.snipe.bearer_tokens or (["dry-run-token"] if self.is_simulation else [])
+        if not tokens:
+            return SnipeResult(False, username, 0, 0.0, "No bearer tokens configured")
+
+        started = self._monotonic()
+        stop_time = started + self.config.snipe.snipe_window_seconds
+        budget = AttemptBudget(self.config.snipe.max_snipe_attempts)
         success_event = asyncio.Event()
-        workers = []
-        for i in range(worker_count):
-            worker = asyncio.create_task(
-                self._snipe_worker(
-                    username=username,
-                    stop_time=stop_time,
-                    tokens=tokens,
-                    worker_index=i,
-                    success_event=success_event,
-                    max_attempts=per_worker_limit,
-                )
-            )
-            workers.append(worker)
-        
-        try:
-            # Wait for workers
-            results = await asyncio.gather(*workers, return_exceptions=True)
-            
-            # Aggregate statistics
-            total_rate_limits = 0
-            total_network_errors = 0
-            
-            # Process results
-            for result in results:
-                if isinstance(result, dict):
-                    attempts += result.get('attempts', 0)
-                    if result.get('success'):
-                        success = True
-                        logger.info(f"🎉 Successfully claimed username: {username}")
-                    
-                    # Aggregate error stats
-                    errors = result.get('errors', {})
-                    total_rate_limits += errors.get('rate_limits', 0)
-                    total_network_errors += errors.get('network_errors', 0)
-            
-            # Log aggregate statistics
-            logger.info(f"📊 Snipe statistics:")
-            logger.info(f"   Total attempts: {attempts}")
-            logger.info(f"   Rate limits hit: {total_rate_limits}")
-            logger.info(f"   Network errors: {total_network_errors}")
-            
-            # Dynamic concurrency feedback (for next snipe)
-            if total_rate_limits > attempts * 0.3:  # >30% rate limited
-                suggested = max(worker_count // 2, len(tokens))
-                logger.warning(f"⚠️ High rate limiting detected. Consider reducing concurrent_requests to {suggested}")
-            elif total_rate_limits == 0 and attempts > 50:
-                suggested = min(worker_count * 2, 20)
-                logger.info(f"✅ No rate limits! You could increase concurrent_requests to {suggested}")
-        
-        except Exception as e:
-            logger.error(f"Sniping error: {e}")
-        
-        total_time = time.time() - start_time
-        
-        return SnipeResult(
-            success=success,
-            username=username,
-            attempts=attempts,
-            total_time=total_time,
-            error_message=None if success else "Failed to claim username"
-        )
-    
+        worker_count = min(self.config.snipe.concurrent_requests, self.config.snipe.max_snipe_attempts)
+        workers = [
+            asyncio.create_task(self._snipe_worker(username, stop_time, tokens, index, success_event, budget))
+            for index in range(worker_count)
+        ]
+        results = await asyncio.gather(*workers, return_exceptions=True)
+
+        success = False
+        errors = {"rate_limits": 0, "network_errors": 0, "server_errors": 0, "auth_errors": 0}
+        for result in results:
+            if isinstance(result, dict):
+                success = success or bool(result.get("success"))
+                for key in errors:
+                    errors[key] += result.get("errors", {}).get(key, 0)
+            elif isinstance(result, Exception) and not isinstance(result, asyncio.CancelledError):
+                logger.error("Worker failed: %s", result)
+
+        logger.info("Snipe completed: attempts=%s success=%s errors=%s", budget.used, success, errors)
+        if self._stop_event.is_set() and not success:
+            message = "Cancelled"
+        elif not success and all(self.rate_limit_tracker.is_token_disabled(token) for token in tokens):
+            message = "All tokens were rejected or ineligible"
+        else:
+            message = None if success else "Failed to claim username"
+        return SnipeResult(success, username, budget.used, self._monotonic() - started, message)
+
+    async def _sleep_or_stop(self, delay: float, success_event: asyncio.Event) -> None:
+        if delay <= 0:
+            await self._sleep(0)
+            return
+        stop_wait = asyncio.create_task(self._stop_event.wait())
+        success_wait = asyncio.create_task(success_event.wait())
+        sleep_wait = asyncio.create_task(self._sleep(delay))
+        done, pending = await asyncio.wait({stop_wait, success_wait, sleep_wait}, return_when=asyncio.FIRST_COMPLETED)
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+
     async def _snipe_worker(
         self,
         username: str,
@@ -545,306 +499,203 @@ class UsernameSniper:
         tokens: List[str],
         worker_index: int,
         success_event: asyncio.Event,
-        max_attempts: Optional[int] = None,
+        budget: AttemptBudget,
     ) -> Dict[str, Any]:
-        """Individual sniping worker with smart retry logic"""
         attempts = 0
         consecutive_failures = 0
         backoff_multiplier = 1.0
-        worker_id = id(asyncio.current_task())
-        ordered_tokens = tokens[worker_index % len(tokens):] + tokens[:worker_index % len(tokens)]
-        
-        # Error tracking for this worker
-        error_stats = {
-            'rate_limits': 0,
-            'network_errors': 0,
-            'server_errors': 0,
-            'auth_errors': 0
-        }
-        
-        logger.info(f"Worker {worker_id} started sniping {username}")
+        ordered_tokens = tokens[worker_index % len(tokens) :] + tokens[: worker_index % len(tokens)]
+        errors = {"rate_limits": 0, "network_errors": 0, "server_errors": 0, "auth_errors": 0}
 
-        async def sleep_or_stop(delay: float) -> None:
-            if delay <= 0:
-                await asyncio.sleep(0)
-                return
-            try:
-                await asyncio.wait_for(success_event.wait(), timeout=delay)
-            except asyncio.TimeoutError:
-                pass
-        
-        while time.time() < stop_time and not success_event.is_set():
-            if max_attempts is not None and attempts >= max_attempts:
+        while self._monotonic() < stop_time and not success_event.is_set() and not self._stop_event.is_set():
+            if self.config.snipe.per_token_rate_limiting:
+                token = self.rate_limit_tracker.get_best_token(ordered_tokens)
+                if token is None:
+                    break
+                wait_time = self.rate_limit_tracker.seconds_until_available(token)
+                if wait_time > 0:
+                    await self._sleep_or_stop(min(wait_time, 0.5), success_event)
+                    continue
+            else:
+                enabled_tokens = [
+                    token for token in ordered_tokens if not self.rate_limit_tracker.is_token_disabled(token)
+                ]
+                if not enabled_tokens:
+                    break
+                token = enabled_tokens[attempts % len(enabled_tokens)]
+
+            if not await budget.reserve():
                 break
+            attempts += 1
+            result = await self._claim_username(username, token)
+            self._connection_stats["requests_made"] += 1
+            status = result.get("status")
 
-            try:
-                if self.config.snipe.per_token_rate_limiting:
-                    bearer_token = self.rate_limit_tracker.get_best_token(ordered_tokens)
-                    wait_time = self.rate_limit_tracker.seconds_until_available(bearer_token)
-                    if wait_time > 0:
-                        await sleep_or_stop(min(wait_time, 0.5))
-                        continue
+            if result.get("success"):
+                success_event.set()
+                return {"success": True, "attempts": attempts, "errors": errors}
+            if status == 429:
+                errors["rate_limits"] += 1
+                retry_after = max(0.0, float(result.get("retry_after", 1.0)))
+                self.rate_limit_tracker.record_rate_limit(token, retry_after)
+                if self.config.snipe.adaptive_delays:
+                    delay = min(retry_after * backoff_multiplier, self.config.snipe.max_backoff_seconds)
+                    backoff_multiplier = min(backoff_multiplier * 1.5, 3.0)
                 else:
-                    bearer_token = ordered_tokens[attempts % len(ordered_tokens)]
+                    delay = min(retry_after, self.config.snipe.max_backoff_seconds)
+                consecutive_failures += 1
+            elif status in {401, 403, 404}:
+                errors["auth_errors"] += 1
+                self.rate_limit_tracker.disable_token(token)
+                delay = 0.0
+                consecutive_failures += 1
+            elif isinstance(status, int) and status >= 500:
+                errors["server_errors"] += 1
+                delay = 0.05
+                consecutive_failures += 1
+            elif status in {"timeout", "network_error", "unknown_error"}:
+                errors["network_errors"] += 1
+                delay = 0.1
+                consecutive_failures += 1
+            else:
+                delay = self.config.snipe.request_delay_ms / 1000.0
+                backoff_multiplier = 1.0
+                consecutive_failures = 0
 
-                result = await self._claim_username(username, bearer_token)
-                attempts += 1
-                self._connection_stats['requests_made'] += 1
-                
-                # Log progress every 10th attempt
-                if attempts % 10 == 0:
-                    logger.info(f"Worker {worker_id}: {attempts} attempts made")
-                
-                if result.get('success'):
-                    logger.info(f"🎉 Worker {worker_id} SUCCESS after {attempts} attempts!")
-                    logger.info(f"Worker {worker_id} stats: {error_stats}")
-                    success_event.set()
-                    return {'success': True, 'attempts': attempts, 'errors': error_stats}
-                
-                # Smart error classification and retry logic
-                status = result.get('status')
-                
-                if status == 429:  # Rate limited
-                    error_stats['rate_limits'] += 1
-                    retry_after = result.get('retry_after', 0.5)
-                    
-                    # Exponential backoff for rate limits (capped at max_backoff)
-                    max_backoff = getattr(self.config.snipe, 'max_backoff_seconds', 5)
-                    backoff_time = min(retry_after * backoff_multiplier, max_backoff)
-                    backoff_multiplier = min(backoff_multiplier * 1.5, 3.0)  # Cap at 3x
-                    
-                    logger.warning(f"Worker {worker_id} rate limited, backing off {backoff_time:.2f}s")
-                    await sleep_or_stop(backoff_time)
-                    consecutive_failures += 1
-                    
-                elif status == 403:  # Forbidden (account cooldown or invalid token)
-                    error_stats['auth_errors'] += 1
-                    logger.warning(f"Worker {worker_id} hit auth error (403), waiting 2s")
-                    await sleep_or_stop(2.0)
-                    consecutive_failures += 1
-                    
-                elif isinstance(status, int) and status >= 500:  # Server error
-                    error_stats['server_errors'] += 1
-                    # Immediate retry for server errors (they're temporary)
-                    logger.warning(f"Worker {worker_id} server error ({status}), immediate retry")
-                    await sleep_or_stop(0.05)  # Tiny delay
-                    consecutive_failures += 1
-                    
-                else:  # Success response or username taken
-                    # Reset backoff on successful request (even if username taken)
-                    backoff_multiplier = 1.0
-                    consecutive_failures = 0
-                    
-                    # Use configured delay for normal requests
-                    delay_seconds = self.config.snipe.request_delay_ms / 1000.0
-                    await sleep_or_stop(delay_seconds)
-                
-                # Circuit breaker: if too many consecutive failures, increase delay
-                if consecutive_failures > 10:
-                    logger.warning(f"Worker {worker_id} circuit breaker: too many failures, pausing 1s")
-                    await sleep_or_stop(1.0)
-                    consecutive_failures = 0
-                
-            except asyncio.TimeoutError:
-                error_stats['network_errors'] += 1
-                logger.warning(f"Worker {worker_id} timeout, immediate retry")
-                attempts += 1
-                consecutive_failures += 1
-                # Immediate retry for timeouts
-                await sleep_or_stop(0.01)
-                
-            except aiohttp.ClientError as e:
-                error_stats['network_errors'] += 1
-                logger.error(f"Worker {worker_id} network error: {e}")
-                attempts += 1
-                consecutive_failures += 1
-                # Short delay for network errors
-                await sleep_or_stop(0.1)
-                
-            except Exception as e:
-                logger.error(f"Worker {worker_id} unexpected error: {e}")
-                attempts += 1
-                consecutive_failures += 1
-                await sleep_or_stop(0.1)
-        
-        logger.info(f"Worker {worker_id} finished with {attempts} attempts (no success)")
-        logger.info(f"Worker {worker_id} final stats: {error_stats}")
-        return {'success': False, 'attempts': attempts, 'errors': error_stats}
-    
-    async def _claim_username(self, username: str, bearer_token: str = None) -> Dict[str, Any]:
-        """Try to claim a username with specified token"""
-        # Safety check for session
-        if not self.session:
-            logger.error("HTTP session is None - cannot make request")
-            return {'success': False, 'error': 'Session not initialized'}
-        
-        # Use provided token or fall back to primary token
-        token = bearer_token or self.config.snipe.bearer_token
-        
-        url = f"https://api.minecraftservices.com/minecraft/profile/name/{username}"
+            if attempts % 25 == 0:
+                logger.info("Worker %s has made %s attempts", worker_index + 1, attempts)
+            if consecutive_failures > 10:
+                delay = max(delay, 1.0)
+                consecutive_failures = 0
+            await self._sleep_or_stop(delay, success_event)
+
+        return {"success": False, "attempts": attempts, "errors": errors}
+
+    async def _simulate_claim(self, username: str, token: str) -> Dict[str, Any]:
+        self._dry_run_attempts += 1
+        attempt = self._dry_run_attempts
+        scenario = self.config.snipe.dry_run_scenario
+        threshold = self.config.snipe.dry_run_success_after
+        if scenario == "success" or (scenario == "taken_then_success" and attempt >= threshold):
+            return {"success": True, "status": 200, "response": "simulated success"}
+        if scenario == "rate_limited_then_success":
+            if attempt >= threshold:
+                return {"success": True, "status": 200, "response": "simulated success"}
+            return {"success": False, "status": 429, "retry_after": 0.001, "error": "simulated rate limit"}
+        if scenario == "auth_error":
+            return {"success": False, "status": 401, "error": "simulated auth error"}
+        if scenario == "server_error":
+            return {"success": False, "status": 503, "error": "simulated server error"}
+        if scenario == "timeout":
+            return {"success": False, "status": "timeout", "error": "simulated timeout"}
+        return {"success": False, "status": 400, "error": "simulated unavailable name"}
+
+    async def _claim_username(self, username: str, bearer_token: str) -> Dict[str, Any]:
+        if self._claim_handler is not None:
+            return await self._claim_handler(username, bearer_token)
+        if self.config.snipe.dry_run:
+            return await self._simulate_claim(username, bearer_token)
+
+        session = await self._ensure_session()
+        url = f"{self.config.snipe.api_base_url}/minecraft/profile/name/{username}"
         headers = {
-            'Authorization': f'Bearer {token}',
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Content-Type': 'application/json',
-            'Accept': 'application/json'
+            "Authorization": f"Bearer {bearer_token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
         }
-        
-        # Get proxy for this request if proxy manager is available
-        proxy = None
-        if self.proxy_manager:
-            try:
-                proxy = await self.proxy_manager.get_proxy()
-                if proxy:
-                    logger.debug(f"Using proxy: {proxy}")
-            except Exception as e:
-                logger.warning(f"Failed to get proxy: {e}")
-        
+        proxy = await self.proxy_manager.get_proxy() if self.proxy_manager else None
+        started = self._monotonic()
         try:
-            # Track connection reuse (aiohttp reuses connections automatically with our connector)
-            self._connection_stats['connections_reused'] += 1
-            
-            async with self.session.put(url, headers=headers, proxy=proxy, timeout=aiohttp.ClientTimeout(total=2)) as response:
-                response_text = await response.text()
+            async with session.put(url, headers=headers, proxy=proxy) as response:
+                body = await response.text()
+                response_time = self._monotonic() - started
                 if proxy and self.proxy_manager:
-                    self.proxy_manager.mark_proxy_success(proxy)
-                
-                # Log detailed response for debugging
-                proxy_info = f" via {proxy}" if proxy else " (direct)"
-                logger.info(f"Claim attempt{proxy_info} - Status: {response.status}")
-                
+                    self.proxy_manager.mark_proxy_success(proxy, response_time)
+                logger.debug(
+                    "Claim response via %s: HTTP %s body=%s",
+                    redact_proxy_url(proxy) if proxy else "direct",
+                    response.status,
+                    body[:200],
+                )
                 if response.status == 200:
-                    logger.info(f"🎉 SUCCESS! Claimed username: {username}")
-                    logger.info(f"Response: {response_text}")
-                    return {'success': True, 'response': response_text}
-                elif response.status == 400:
-                    logger.warning(f"Bad request (400) - Username might be taken or invalid")
-                    logger.debug(f"Response: {response_text}")
-                    return {'success': False, 'error': 'Bad request - username taken or invalid', 'status': 400}
-                elif response.status == 401:
-                    logger.error(f"Unauthorized (401) - Bearer token is invalid or expired")
-                    logger.debug(f"Response: {response_text}")
-                    return {'success': False, 'error': 'Invalid bearer token', 'status': 401}
-                elif response.status == 403:
-                    logger.warning(f"Forbidden (403) - Account on cooldown or username unavailable")
-                    logger.debug(f"Response: {response_text}")
-                    return {'success': False, 'error': 'Account on cooldown or username unavailable', 'status': 403}
-                elif response.status == 404:
-                    logger.error(f"Not found (404) - Account doesn't own Minecraft")
-                    logger.debug(f"Response: {response_text}")
-                    return {'success': False, 'error': 'Account does not own Minecraft', 'status': 404}
-                elif response.status == 429:
-                    # Extract retry-after header if present
-                    retry_after = response.headers.get('Retry-After', '1')
+                    return {"success": True, "status": 200, "response": body}
+                if response.status == 429:
                     try:
-                        retry_seconds = float(retry_after)
-                    except (ValueError, TypeError):
-                        retry_seconds = 1.0
-                    
-                    logger.warning(f"Rate limited (429) - Backing off for {retry_seconds}s")
-                    logger.debug(f"Response: {response_text}")
-                    
-                    # Record rate limit for this token
-                    if hasattr(self, 'rate_limit_tracker') and token:
-                        self.rate_limit_tracker.record_rate_limit(token, retry_seconds)
-                    
-                    # Return rate limit info for intelligent handling
-                    return {
-                        'success': False, 
-                        'error': 'Rate limited', 
-                        'status': 429,
-                        'retry_after': retry_seconds
-                    }
-                else:
-                    logger.warning(f"Unexpected status {response.status}: {response_text}")
-                
+                        retry_after = float(response.headers.get("Retry-After", "1"))
+                    except (TypeError, ValueError):
+                        retry_after = 1.0
+                    return {"success": False, "status": 429, "retry_after": retry_after, "error": "Rate limited"}
+                messages = {
+                    400: "Username is taken or invalid",
+                    401: "Bearer token is invalid or expired",
+                    403: "Account is ineligible or on cooldown",
+                    404: "Account does not own Minecraft",
+                }
                 return {
-                    'success': response.status == 200,
-                    'status': response.status,
-                    'username': username,
-                    'response': response_text
+                    "success": False,
+                    "status": response.status,
+                    "error": messages.get(response.status, f"Unexpected HTTP {response.status}"),
+                    "response": body[:500],
                 }
         except asyncio.TimeoutError:
-            logger.warning(f"Timeout claiming {username}")
             if proxy and self.proxy_manager:
                 self.proxy_manager.mark_proxy_failure(proxy, "timeout")
-            return {'success': False, 'error': 'Request timeout', 'status': 'timeout'}
-        except aiohttp.ClientError as e:
-            logger.error(f"Network error claiming {username}: {e}")
+            self._connection_stats["connection_errors"] += 1
+            return {"success": False, "status": "timeout", "error": "Request timeout"}
+        except aiohttp.ClientError as exc:
             if proxy and self.proxy_manager:
-                self.proxy_manager.mark_proxy_failure(proxy, str(e))
-            return {'success': False, 'error': f'Network error: {str(e)}', 'status': 'network_error'}
-        except Exception as e:
-            logger.error(f"Unexpected error claiming {username}: {e}")
+                self.proxy_manager.mark_proxy_failure(proxy, type(exc).__name__)
+            self._connection_stats["connection_errors"] += 1
+            return {"success": False, "status": "network_error", "error": str(exc)}
+        except Exception as exc:
             if proxy and self.proxy_manager:
-                self.proxy_manager.mark_proxy_failure(proxy, str(e))
-            return {'success': False, 'error': str(e), 'status': 'unknown_error'}
-    
-    async def run_benchmark(self, duration: int = 5, requests: int = 10) -> Dict[str, float]:
-        """Run a benchmark to test timing precision"""
-        logger.info(f"📊 Starting benchmark: {requests} requests over {duration} seconds")
-        
+                self.proxy_manager.mark_proxy_failure(proxy, type(exc).__name__)
+            return {"success": False, "status": "unknown_error", "error": str(exc)}
+
+    async def run_benchmark(self, requests: int = 10) -> Dict[str, float]:
         results = []
-        
-        # Ensure high priority is set if enabled
+        gc_was_enabled = gc.isenabled()
+        process = None
+        original_priority = None
+        if self.config.snipe.dry_run:
+            self.time_sync.time_offset = 0.0
+            self.time_sync.last_sync = datetime.now(timezone.utc)
+        else:
+            await self.time_sync.sync_time()
         if self.config.performance.high_priority:
             try:
-                p = psutil.Process(os.getpid())
-                if sys.platform == "win32":
-                    p.nice(psutil.HIGH_PRIORITY_CLASS)
-            except Exception:
-                pass
-        
-        # Disable GC for benchmark accuracy
-        if self.config.performance.gc_disable:
+                process = psutil.Process(os.getpid())
+                original_priority = process.nice()
+                process.nice(psutil.HIGH_PRIORITY_CLASS if sys.platform == "win32" else -10)
+            except (PermissionError, psutil.AccessDenied, OSError) as exc:
+                logger.warning("Could not raise benchmark process priority: %s", exc)
+        if self.config.performance.gc_disable and gc_was_enabled:
             gc.disable()
-            
         try:
-            try:
-                # Try to sync time once BEFORE benchmark loop to avoid network jitter
-                # This is optional - benchmark works fine with local time only
-                await self.time_sync.sync_time()
-                # Force last_sync to be very recent so it doesn't try again
-                self.time_sync.last_sync = datetime.now(timezone.utc)
-                logger.info("Time synced successfully for benchmark")
-            except Exception as e:
-                logger.warning(f"Time sync failed (network issue), using local time: {e}")
-                # Benchmark will use local system time, which is fine for measuring timing precision
-                self.time_sync.last_sync = datetime.now(timezone.utc)
-            
-            for i in range(requests):
-                # Target time: 500ms from now (in Corrected Time domain)
-                start_time = self.time_sync.get_accurate_time()
-                target = start_time + timedelta(milliseconds=500)
-                
-                # Use our accurate timer
-                await self.timer.wait_until(target, busy_wait_ms=self.config.performance.busy_wait_ms)
-                
-                # Measure "wake up" time immediately (in Corrected Time domain)
+            for _ in range(requests):
+                target = self.time_sync.get_accurate_time() + timedelta(milliseconds=100)
+                await self.timer.wait_until(
+                    target,
+                    busy_wait_ms=self.config.performance.busy_wait_ms,
+                )
                 actual = self.time_sync.get_accurate_time()
-                
-                # Calculate jitter (difference in microseconds)
-                diff = (actual - target).total_seconds() * 1000 * 1000 # microseconds
-                results.append(diff)
-                
-                logger.info(f"Measure {i+1}/{requests}: Offset {diff:.1f}μs")
-                
-                # Wait a bit before next measurement
-                await asyncio.sleep(0.5)
-                
+                results.append((actual - target).total_seconds() * 1_000_000)
+                await self._sleep(0.01)
         finally:
-            if self.config.performance.gc_disable:
+            if self.config.performance.gc_disable and gc_was_enabled:
                 gc.enable()
-        
+            if process is not None and original_priority is not None:
+                try:
+                    process.nice(original_priority)
+                except (psutil.Error, OSError):
+                    logger.debug("Could not restore benchmark process priority")
         if not results:
             return {}
-            
-        stats = {
+        return {
             "count": len(results),
             "mean_offset_us": statistics.mean(results),
             "median_offset_us": statistics.median(results),
-            "stdev_us": statistics.stdev(results) if len(results) > 1 else 0,
+            "stdev_us": statistics.stdev(results) if len(results) > 1 else 0.0,
             "min_us": min(results),
-            "max_us": max(results)
+            "max_us": max(results),
         }
-        
-        return stats

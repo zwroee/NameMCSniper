@@ -1,350 +1,222 @@
-#!/usr/bin/env python3
-"""
-Time synchronization module for accurate sniping timing
-"""
+"""Clock synchronization and precise, testable scheduling primitives."""
 
-import time
 import asyncio
-import aiohttp
 import logging
-from datetime import datetime, timezone, timedelta
-from typing import Optional, List
+from datetime import datetime, timedelta, timezone
+from typing import Awaitable, Callable, List, Optional
+
+import aiohttp
 
 try:
     import ntplib
+
     _HAS_NTPLIB = True
-except ImportError:
+except ImportError:  # pragma: no cover - exercised in minimal installations
     _HAS_NTPLIB = False
+
 
 logger = logging.getLogger(__name__)
 
+
 class TimeSync:
-    """Handles time synchronization for accurate sniping"""
-    
-    def __init__(self):
-        self.time_offset = 0.0  # Offset from true time in seconds
-        self.last_sync = None
-        self.sync_sources = [
-            "http://worldtimeapi.org/api/timezone/UTC",
-            "https://timeapi.io/api/Time/current/zone?timeZone=UTC", 
-            "http://worldclockapi.com/api/json/utc/now",
-            # Additional fallback sources
-            "https://worldtimeapi.org/api/timezone/UTC",  # HTTPS version
-            "http://worldtimeapi.org/api/ip",  # Auto-detect timezone
-        ]
-    
+    """Estimate the difference between the system clock and trusted UTC time."""
+
+    def __init__(
+        self,
+        sync_sources: Optional[List[str]] = None,
+        ntp_servers: Optional[List[str]] = None,
+        request_timeout: float = 3.0,
+    ):
+        self.time_offset = 0.0
+        self.last_sync: Optional[datetime] = None
+        self.sync_sources = (
+            list(sync_sources)
+            if sync_sources is not None
+            else [
+                "https://worldtimeapi.org/api/timezone/UTC",
+                "https://timeapi.io/api/Time/current/zone?timeZone=UTC",
+            ]
+        )
+        self.ntp_servers = (
+            list(ntp_servers)
+            if ntp_servers is not None
+            else [
+                "pool.ntp.org",
+                "time.cloudflare.com",
+                "time.google.com",
+                "time.windows.com",
+            ]
+        )
+        self.request_timeout = request_timeout
+
     async def sync_time(self) -> bool:
-        """Synchronize with internet time sources (multi-source with fallback)"""
-        logger.info("🕐 Synchronizing time with internet sources...")
-        
-        offsets = []
-        
-        # Try NTP first - it's more reliable on VPS and works even when HTTP APIs are blocked
-        ntp_offset = await asyncio.get_event_loop().run_in_executor(None, lambda: self._get_ntp_offset_sync())
-        if ntp_offset is not None:
-            offsets.append(ntp_offset)
-            logger.debug(f"NTP offset: {ntp_offset:.3f}s")
-        
-        for source in self.sync_sources:
-            try:
-                offset = await self._get_time_offset(source)
-                if offset is not None:
-                    offsets.append(offset)
-                    logger.debug(f"Time source {source}: offset {offset:.3f}s")
-            except Exception as e:
-                logger.debug(f"Could not reach time API {source}: {e}")
-                continue
-        
+        """Synchronize concurrently, preferring NTP and using HTTPS as fallback."""
+        logger.info("Synchronizing clock with UTC sources...")
+        ntp_task = asyncio.create_task(self._get_ntp_offsets())
+        http_task = asyncio.create_task(self._get_http_offsets())
+        ntp_offsets, http_offsets = await asyncio.gather(ntp_task, http_task)
+
+        # NTP includes protocol-level delay compensation and is more accurate than
+        # timestamps embedded in HTTP responses. Do not average the two classes.
+        offsets = ntp_offsets or http_offsets
         if not offsets:
-            # If all internet sources fail, use local system time as fallback
-            # On a VPS the system clock is usually NTP-synced by the host, so this is fine
-            logger.warning("⚠️ All internet time sources unreachable (likely firewall/network restriction on this VPS)")
-            logger.warning("⚠️ Falling back to local system clock. On a VPS this is usually accurate (host NTP).")
-            logger.warning("⚠️ If you see large timing errors, run: sudo ntpdate pool.ntp.org  OR  sudo timedatectl set-ntp true")
-            
-            # Set minimal offset (assume system time is reasonably accurate)
             self.time_offset = 0.0
             self.last_sync = datetime.now(timezone.utc)
-            
-            logger.info("✅ Fallback to local system time (offset: 0.000s)")
-            return True
-        
-        # Outlier detection: use median if we have multiple sources
-        if len(offsets) >= 2:
-            offsets.sort()
-            median_offset = offsets[len(offsets) // 2]
-            
-            # Reject outliers (>1s from median)
-            filtered_offsets = [o for o in offsets if abs(o - median_offset) < 1.0]
-            
-            if filtered_offsets:
-                self.time_offset = sum(filtered_offsets) / len(filtered_offsets)
-                logger.info(f"✅ Time synced using {len(filtered_offsets)}/{len(offsets)} sources: offset {self.time_offset:.3f}s")
-            else:
-                self.time_offset = median_offset
-                logger.warning(f"⏰ Time synced with outliers: offset {self.time_offset:.3f}s")
-        else:
-            # Single source
-            self.time_offset = offsets[0]
-            logger.info(f"✅ Time synchronized (offset: {self.time_offset:.3f}s)")
-        
-        self.last_sync = datetime.now(timezone.utc)
-        
-        if abs(self.time_offset) > 1.0:
-            logger.warning(f"⚠️ System clock is {self.time_offset:.2f} seconds off!")
-            logger.warning("Consider syncing your system clock with NTP")
-        
-        return True
-    
-    def _get_ntp_offset_sync(self) -> Optional[float]:
-        """Synchronous wrapper for NTP offset - run in executor"""
-        if not _HAS_NTPLIB:
-            return None
-        
-        ntp_servers = [
-            'pool.ntp.org',
-            'time.cloudflare.com',
-            'time.google.com',
-            'time.windows.com',
-        ]
-        
-        client = ntplib.NTPClient()
-        for server in ntp_servers:
-            try:
-                response = client.request(server, version=3, timeout=3)
-                return response.offset
-            except Exception:
-                continue
-        return None
+            logger.warning("No external clock source was reachable; using the local system clock")
+            return False
 
-    def _parse_worldtimeapi(self, data: dict) -> Optional[datetime]:
-        """Parse worldtimeapi.org response"""
+        offsets.sort()
+        median = offsets[len(offsets) // 2]
+        filtered = [offset for offset in offsets if abs(offset - median) <= 0.250]
+        selected = filtered or [median]
+        self.time_offset = sum(selected) / len(selected)
+        self.last_sync = datetime.now(timezone.utc)
+        logger.info(
+            "Clock synchronized from %s source(s); offset %.3f seconds",
+            len(selected),
+            self.time_offset,
+        )
+        if abs(self.time_offset) > 1.0:
+            logger.warning("System clock differs from UTC by %.2f seconds", self.time_offset)
+        return True
+
+    async def _get_ntp_offsets(self) -> List[float]:
+        if not _HAS_NTPLIB:
+            return []
+        tasks = [asyncio.to_thread(self._get_ntp_offset_sync, server) for server in self.ntp_servers]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        return [float(value) for value in results if isinstance(value, (int, float))]
+
+    def _get_ntp_offset_sync(self, server: str) -> Optional[float]:
         try:
-            dt_str = data.get('utc_datetime') or data.get('datetime')
-            if dt_str:
-                return datetime.fromisoformat(dt_str.replace('Z', '+00:00'))
-        except Exception as e:
-            logger.debug(f"Failed to parse worldtimeapi: {e}")
-        return None
-    
-    def _parse_worldclockapi(self, data: dict) -> Optional[datetime]:
-        """Parse worldclockapi.com response"""
+            response = ntplib.NTPClient().request(server, version=3, timeout=self.request_timeout)
+            return float(response.offset)
+        except Exception as exc:
+            logger.debug("NTP source %s failed: %s", server, exc)
+            return None
+
+    async def _get_http_offsets(self) -> List[float]:
+        timeout = aiohttp.ClientTimeout(total=self.request_timeout)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            results = await asyncio.gather(
+                *(self._get_time_offset(source, session) for source in self.sync_sources),
+                return_exceptions=True,
+            )
+        offsets: List[float] = []
+        for source, result in zip(self.sync_sources, results, strict=True):
+            if isinstance(result, (int, float)):
+                offsets.append(float(result))
+            elif isinstance(result, Exception):
+                logger.debug("HTTPS clock source %s failed: %s", source, result)
+        return offsets
+
+    @staticmethod
+    def _parse_server_time(data: dict) -> Optional[datetime]:
+        value = data.get("utc_datetime") or data.get("dateTime") or data.get("currentDateTime") or data.get("datetime")
+        if not value or not isinstance(value, str):
+            return None
+        value = value.strip().replace("Z", "+00:00")
         try:
-            dt_str = data.get('currentDateTime')
-            if dt_str:
-                # Format: "2024-02-15T05:30Z"
-                return datetime.fromisoformat(dt_str.replace('Z', '+00:00'))
-        except Exception as e:
-            logger.debug(f"Failed to parse worldclockapi: {e}")
-        return None
-    
-    async def _get_time_offset(self, source: str) -> Optional[float]:
-        """Get time offset from a specific source"""
-        start_time = time.time()
-        
-        async with aiohttp.ClientSession() as session:
-            async with session.get(source, timeout=aiohttp.ClientTimeout(total=5)) as response:
-                if response.status != 200:
-                    return None
-                
-                data = await response.json()
-                network_delay = (time.time() - start_time) / 2  # Estimate one-way delay
-                
-                # Parse different API formats with robust handling
-                server_time = None
-                
-                if 'utc_datetime' in data:  # worldtimeapi.org UTC endpoint
-                    time_str = data['utc_datetime'].replace('Z', '+00:00')
-                    try:
-                        server_time = datetime.fromisoformat(time_str)
-                    except ValueError:
-                        # Handle microseconds precision issues
-                        if '.' in time_str:
-                            time_str = time_str.split('.')[0] + '+00:00'
-                        server_time = datetime.fromisoformat(time_str)
-                
-                elif 'datetime' in data and 'utc_offset' in data:  # worldtimeapi.org IP endpoint
-                    # Convert local time to UTC using offset
-                    local_time_str = data['datetime']
-                    utc_offset = data['utc_offset']  # Format: "+05:00" or "-05:00"
-                    
-                    try:
-                        # Parse local time
-                        if local_time_str.endswith('Z'):
-                            local_time_str = local_time_str.replace('Z', '+00:00')
-                        local_time = datetime.fromisoformat(local_time_str)
-                        
-                        # Parse UTC offset
-                        offset_hours = int(utc_offset[:3])
-                        offset_minutes = int(utc_offset[4:6]) if len(utc_offset) > 4 else 0
-                        if utc_offset.startswith('-'):
-                            offset_minutes = -offset_minutes
-                        
-                        total_offset = timedelta(hours=offset_hours, minutes=offset_minutes)
-                        server_time = local_time - total_offset  # Convert to UTC
-                    except (ValueError, IndexError):
-                        return None
-                
-                elif 'dateTime' in data:  # timeapi.io
-                    time_str = data['dateTime']
-                    try:
-                        # Handle high precision microseconds
-                        if '.' in time_str and len(time_str.split('.')[1]) > 6:
-                            # Truncate microseconds to 6 digits
-                            parts = time_str.split('.')
-                            microseconds = parts[1][:6]
-                            time_str = f"{parts[0]}.{microseconds}"
-                        
-                        server_time = datetime.fromisoformat(time_str)
-                        
-                        # Ensure timezone aware - convert to UTC if needed
-                        if server_time.tzinfo is None:
-                            server_time = server_time.replace(tzinfo=timezone.utc)
-                        elif server_time.tzinfo != timezone.utc:
-                            server_time = server_time.astimezone(timezone.utc)
-                            
-                    except ValueError:
-                        # Fallback: remove microseconds entirely
-                        time_str = time_str.split('.')[0]
-                        if not time_str.endswith('Z') and '+' not in time_str and '-' not in time_str[-6:]:
-                            time_str += 'Z'
-                        server_time = datetime.fromisoformat(time_str.replace('Z', '+00:00'))
-                
-                elif 'currentDateTime' in data:  # worldclockapi.com
-                    time_str = data['currentDateTime']
-                    try:
-                        # Handle 'Z' suffix
-                        if time_str.endswith('Z'):
-                            time_str = time_str.replace('Z', '+00:00')
-                        server_time = datetime.fromisoformat(time_str)
-                    except ValueError:
-                        # Fallback parsing
-                        time_str = time_str.replace('Z', '')
-                        server_time = datetime.fromisoformat(time_str + '+00:00')
-                
-                if server_time:
-                    # Ensure both times are timezone-aware for comparison
-                    if server_time.tzinfo is None:
-                        server_time = server_time.replace(tzinfo=timezone.utc)
-                    elif server_time.tzinfo != timezone.utc:
-                        server_time = server_time.astimezone(timezone.utc)
-                    
-                    # Calculate offset accounting for network delay
-                    local_time = datetime.now(timezone.utc)
-                    offset = (server_time - local_time).total_seconds() - network_delay
-                    return offset
-        
-        return None
-    
+            parsed = datetime.fromisoformat(value)
+        except ValueError:
+            # Some services return more than six fractional-second digits.
+            if "." not in value:
+                return None
+            head, tail = value.split(".", 1)
+            suffix = ""
+            for marker in ("+", "-"):
+                position = tail.find(marker)
+                if position > 0:
+                    suffix = tail[position:]
+                    tail = tail[:position]
+                    break
+            try:
+                parsed = datetime.fromisoformat(f"{head}.{tail[:6]}{suffix}")
+            except ValueError:
+                return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    @staticmethod
+    def calculate_offset(server_time: datetime, started_at: datetime, received_at: datetime) -> float:
+        """Estimate offset against the local midpoint of an HTTP round trip."""
+        midpoint = started_at + (received_at - started_at) / 2
+        return (server_time - midpoint).total_seconds()
+
+    async def _get_time_offset(self, source: str, session: aiohttp.ClientSession) -> Optional[float]:
+        started_at = datetime.now(timezone.utc)
+        async with session.get(source) as response:
+            if response.status != 200:
+                return None
+            data = await response.json()
+        received_at = datetime.now(timezone.utc)
+        server_time = self._parse_server_time(data)
+        if server_time is None:
+            return None
+        return self.calculate_offset(server_time, started_at, received_at)
+
     def get_accurate_time(self) -> datetime:
-        """Get current time with offset correction"""
-        current_time = datetime.now(timezone.utc)
-        corrected_time = current_time + timedelta(seconds=self.time_offset)
-        return corrected_time
-    
+        return datetime.now(timezone.utc) + timedelta(seconds=self.time_offset)
+
     def should_resync(self) -> bool:
-        """Check if time should be re-synchronized"""
         if not self.last_sync:
             return True
-        
-        # Resync every 30 minutes
-        time_since_sync = datetime.now(timezone.utc) - self.last_sync
-        return time_since_sync > timedelta(minutes=30)
+        return datetime.now(timezone.utc) - self.last_sync > timedelta(minutes=30)
+
 
 class AccurateTimer:
-    """High-precision timer for sniping"""
-    
-    def __init__(self, time_sync: TimeSync):
+    """Wait for a UTC target while allowing virtual sleep in tests."""
+
+    def __init__(
+        self,
+        time_sync: TimeSync,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    ):
         self.time_sync = time_sync
-    
-    async def wait_until(self, target_time: datetime, callback=None, busy_wait_ms: int = 0):
-        """Wait until exact target time with high precision"""
-        logger.info(f"⏰ Waiting until: {target_time.isoformat()}")
-        
-        # Resync time if needed
+        self._sleep = sleep
+
+    async def wait_until(
+        self,
+        target_time: datetime,
+        callback=None,
+        busy_wait_ms: int = 0,
+        cancel_event: Optional[asyncio.Event] = None,
+    ) -> None:
+        if target_time.tzinfo is None:
+            raise ValueError("target_time must be timezone-aware")
         if self.time_sync.should_resync():
             await self.time_sync.sync_time()
-        
+
+        busy_wait_seconds = max(0, busy_wait_ms) / 1000.0
         while True:
+            if cancel_event and cancel_event.is_set():
+                raise asyncio.CancelledError("Timer cancelled")
+
             current_time = self.time_sync.get_accurate_time()
-            time_remaining = (target_time - current_time).total_seconds()
-            
-            if time_remaining <= 0:
-                logger.info("🚨 TARGET TIME REACHED!")
-                break
-            
-            # Call callback for countdown updates
+            remaining = (target_time - current_time).total_seconds()
+            if remaining <= 0:
+                return
+
             if callback:
                 try:
-                    await callback(time_remaining, current_time, target_time)
-                except Exception as e:
-                    logger.warning(f"Callback error: {e}")
-            
-            # Smart sleep intervals for accuracy with busy-wait support
-            busy_wait_seconds = busy_wait_ms / 1000.0
-            
-            if time_remaining <= busy_wait_seconds:
-                # 🚀 CRITICAL PHASE: Busy wait (Spin lock)
-                # We interpret "time_remaining" relative to our own clock functions
-                # To be super precise, we just stay in this loop checking time
-                # blocking the event loop (which is what we want for 'pro' precision)
-                while True:
-                    if (target_time - self.time_sync.get_accurate_time()).total_seconds() <= 0:
-                        break
-                break # Break outer loop, we are done
-                
-            elif time_remaining > 60:
-                sleep_time = min(10, time_remaining - 60)
-            elif time_remaining > 10:
-                 sleep_time = min(1, time_remaining - 10)
+                    await callback(remaining, current_time, target_time)
+                except Exception as exc:
+                    logger.warning("Countdown callback failed: %s", exc)
+
+            if remaining <= busy_wait_seconds:
+                while (target_time - self.time_sync.get_accurate_time()).total_seconds() > 0:
+                    if cancel_event and cancel_event.is_set():
+                        raise asyncio.CancelledError("Timer cancelled")
+                return
+            if remaining > 60:
+                sleep_time = min(10.0, max(0.001, remaining - 60))
+            elif remaining > 10:
+                sleep_time = min(1.0, max(0.001, remaining - 10))
             else:
-                # Approaching target. 
-                # If we have a busy_wait buffer, we sleep until we hit that buffer.
-                # But we need to account for OS sleep inaccuracy (~15ms on Windows).
-                # So we aim to wake up 'safe_buffer' (e.g. 50ms) BEFORE the busy_wait phase starts.
-                safe_buffer = 0.05
-                time_to_busy_phase = time_remaining - busy_wait_seconds
-                
-                if time_to_busy_phase > safe_buffer:
-                    sleep_time = time_to_busy_phase - safe_buffer
-                else:
-                    # We are extremely close to the busy wait phase but not quite there.
-                    # Sleeping even 0 might overshoot if the OS scheduler is slow.
-                    # Just yield to event loop briefly.
-                    sleep_time = 0
-            
-            await asyncio.sleep(sleep_time)
-    
+                sleep_time = min(0.1, max(0.001, remaining - busy_wait_seconds))
+            await self._sleep(sleep_time)
+
     def calculate_drop_windows(self, base_drop_time: datetime, window_count: int = 5) -> List[datetime]:
-        """Calculate multiple drop time windows to account for uncertainty"""
-        windows: List[datetime] = []
-        
-        # Create windows: exact time, +0.1s, +0.2s, +0.5s, +1.0s
         offsets = [0.0, 0.1, 0.2, 0.5, 1.0]
-        
-        for i in range(min(window_count, len(offsets))):
-            window_time = base_drop_time + timedelta(seconds=offsets[i])
-            windows.append(window_time)
-        
-        return windows
-
-# Test function
-async def test_time_accuracy():
-    """Test time synchronization accuracy"""
-    print("🧪 Testing time synchronization...")
-    
-    time_sync = TimeSync()
-    success = await time_sync.sync_time()
-    
-    if success:
-        print(f"✅ Time sync successful!")
-        print(f"   Offset: {time_sync.time_offset:.3f} seconds")
-        print(f"   System time: {datetime.now(timezone.utc).isoformat()}")
-        print(f"   Corrected time: {time_sync.get_accurate_time().isoformat()}")
-    else:
-        print("❌ Time sync failed!")
-    
-    return time_sync
-
-if __name__ == "__main__":
-    asyncio.run(test_time_accuracy())
+        return [base_drop_time + timedelta(seconds=value) for value in offsets[: max(0, window_count)]]

@@ -1,5 +1,9 @@
 # Python
 __pycache__/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 *.py[cod]
 *$py.class
 *.so
@@ -31,8 +35,14 @@ env.bak/
 venv.bak/
 
 # Configuration files (may contain sensitive data)
+config.yaml
+tokens.txt
+proxies.txt
+proxies_working.txt
+proxies_working*.txt
 !config.yaml.example
 !requirements.txt
+!requirements-dev.txt
 
 # Logs
 logs/

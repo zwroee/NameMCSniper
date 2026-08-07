@@ -1,5 +1,0 @@
-# Add proxies here, one per line
-# Supported formats:
-# ip:port
-# user:pass@ip:port
-# protocol://user:pass@ip:port

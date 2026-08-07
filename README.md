@@ -1,126 +1,141 @@
-<div align="center">
-<img width="2188" height="740" alt="download (12)" src="https://github.com/user-attachments/assets/c9ff5adc-7f55-45e2-bad1-11ac2c397dc0" />
+# NameMC Sniper
 
-Fast Minecraft username sniping with a simple CLI, token checks, proxy support, and precise drop timing.
+A safe-by-default Python CLI for simulating and, only when deliberately unlocked, issuing timed Minecraft username-change requests.
 
-[![Python 3.8+](https://img.shields.io/badge/python-3.8%2B-blue.svg)](https://python.org)
-[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-</div>
+The default mode is a local simulation. It does not contact Minecraft, Discord, proxies, NTP, or internet time services and cannot change an account.
 
-<div align="center">
+## Requirements
 
-## 🪶 Recommended Proxies
-
-[BirdProxies.com](https://www.birdproxies.com/@NAMEMCSNIPER)
-
-Get 10% off + 15% extra data using the link above!
-
-</div>
-
-## What It Does
-
-NameMC Sniper waits for a NameMC drop time, syncs timing as closely as possible, then sends Minecraft name-change requests during the claim window. It supports multiple bearer tokens, connection pooling, basic proxy rotation, Discord webhooks, and a menu mode if you do not want to use commands directly.
-
-## Install
+- Python 3.10 or newer
+- A correct system clock for live timing
 
 ```bash
-git clone https://github.com/zwroee/NameMcSniper.git
-cd NameMcSniper
-pip install -r requirements.txt
+python -m venv .venv
+# Windows
+.venv\Scripts\python -m pip install -r requirements.txt
+# Linux/macOS
+.venv/bin/python -m pip install -r requirements.txt
+```
+
+Create a safe default configuration:
+
+```bash
 python Main.py config-create
 ```
 
-Edit `config.yaml` after it is created. Do not commit your real `config.yaml` if it contains tokens, webhooks, or proxies.
+`config.yaml`, `tokens.txt`, `proxies.txt`, and generated proxy lists are ignored because they may contain credentials.
 
-## Run
+## Easiest CLI workflow
 
-Menu mode:
+Run one command and answer the prompts:
 
-```bash
-python menu.py
+```powershell
+.\.venv\Scripts\python.exe Main.py easy
 ```
 
-Command line:
+Easy CLI mode asks for:
 
-```bash
-python Main.py snipe-at -u "TargetName" -w "5/7/2026 • 6:06:50 PM"
-```
+1. The target username.
+2. Safe simulation or a real claim.
+3. Right now, 30 seconds from now, or an exact NameMC drop time.
 
-The drop time format is:
+For an exact drop time, common US timezones are presented as numbered choices (Eastern, Central,
+Mountain, Pacific, or UTC), so an IANA timezone only needs to be typed for less common locations.
+
+Simulation is the default. For a real claim, the wizard uses the first token loaded from `tokens.txt`, shows
+the exact action, and asks for confirmation. It handles the live acknowledgement internally for that single
+run, uses a direct connection, and keeps proxies and Discord out of the critical path.
+
+To use one or more accounts without putting secrets in YAML, create `tokens.txt` beside `config.yaml` and put
+one bearer token on each line:
 
 ```text
-M/D/YYYY • H:MM:SS AM/PM
+first-account-token
+second-account-token
+third-account-token
 ```
 
-Copy it from NameMC exactly. Regular colons are supported, and the older `∶` colon style also works.
+Blank lines and lines beginning with `#` are ignored. Tokens from `tokens.txt` are merged with any tokens in
+`config.yaml`, duplicates are removed, and file-based tokens are not copied into YAML when configuration is
+saved.
 
-## Config
+All valid configured accounts are preflighted, and concurrent workers are distributed across them during the
+same claim window.
 
-Keep the config conservative unless you have tested your setup.
+Proxies follow the same sibling-file convention: put one HTTP(S) proxy per line in `proxies.txt`. Blank and
+comment lines are ignored, duplicates are removed, and file proxies are not copied into YAML on save. Set
+`proxy.enabled: true` in `config.yaml` when you actually want the normal advanced commands to use them. Easy
+CLI mode intentionally stays direct and does not use proxies.
 
-```yaml
-snipe:
-  target_username: "TargetName"
-  bearer_token: "your_minecraft_bearer_token"
-  bearer_tokens:
-    - "your_minecraft_bearer_token"
-  concurrent_requests: 10
-  request_delay_ms: 20
-  max_snipe_attempts: 3000
+## Safe simulation
 
-performance:
-  high_priority: true
-  pre_warm_connections: true
-  busy_wait_ms: 50
-
-proxy:
-  enabled: false
-  proxies: []
-```
-
-Useful checks:
+Run the entire worker, rate-limit, attempt-budget, and result path immediately:
 
 ```bash
-python Main.py test-token
-python Main.py benchmark
-python Main.py check-proxies
-python Main.py config-validate
+python Main.py simulate
+python Main.py simulate --scenario rate_limited_then_success --success-after 4
+python Main.py simulate --scenario auth_error
 ```
 
-## Proxies
+Supported scenarios are `success`, `taken`, `taken_then_success`, `rate_limited_then_success`, `auth_error`, `server_error`, and `timeout`.
 
-Use HTTP or HTTPS proxies in this format:
+Scheduled commands are also dry runs unless `--live` is supplied:
 
-```text
-http://username:password@host:port
-http://host:port
+```bash
+python Main.py snipe-at -u "TargetName" -w "5/7/2026 • 6:06:50 PM" --timezone America/New_York
 ```
 
-Residential or ISP proxies are usually the best fit. Avoid free proxies and random datacenter lists; they are often slow, blocked, or already abused. SOCKS proxies are not recommended for this build unless you add proper SOCKS support, because the current request code is built around aiohttp's normal HTTP proxy handling.
+Timezones are explicit and may be an IANA name (`America/New_York`), `UTC`, or an offset such as `-04:00`. Ambiguous or nonexistent daylight-saving times are rejected.
 
-For best results, test direct VPS latency first. A clean VPS connection can be faster than bad proxies. Only enable proxies if they are stable, low-latency, and pass `python Main.py check-proxies`.
+## Automated tests
 
-## Notes
+Install development dependencies and run the suite:
 
-- Run on a machine with a correct system clock.
-- More workers is not always better. Too many requests can trigger rate limits.
-- More valid tokens helps more than spamming one token harder.
-- If Linux cannot set high process priority, the sniper still runs; it just will not get the priority boost.
+```bash
+python -m pip install -r requirements-dev.txt
+pytest
+ruff check .
+```
 
-## VPS
+Tests cover parsing, timezones, virtual-clock scheduling, global attempt limits, token errors, rate limiting, configuration, proxy redaction, resource cleanup, CLI simulation, and the real aiohttp request stack against a loopback fake Minecraft API. The test harness rejects non-loopback aiohttp and DNS access.
 
-A VPS is recommended for serious drops because it can stay online, keep a steady clock, and usually has better network stability than a home connection. If you do not have one, Oracle Cloud's free tier can work.
+No VPS, Minecraft account, bearer token, Discord webhook, or public proxy is required.
 
-Oracle free VPS downsides:
+## Live safety lock
 
-- Setup is more annoying than a normal paid VPS.
-- Free instances can be reclaimed or limited depending on availability.
-- Network routing is not guaranteed to be the fastest for Minecraft services.
-- ARM instances may need a little more package/setup patience.
-- You still need to secure it, keep Python updated, and avoid committing secrets.
+Live claims require all three deliberate actions:
 
-Test your latency and timing before relying on it for an important name.
+1. Configure a valid token and `timezone_name`.
+2. Pass `--live`.
+3. Set the acknowledgement environment variable exactly:
 
-## Legal
+PowerShell:
 
-Use at your own risk. Respect Minecraft's terms, API limits, and account restrictions.
+```powershell
+$env:NAMEMC_SNIPER_LIVE_ACK='I_UNDERSTAND_THIS_CHANGES_A_REAL_ACCOUNT'
+python Main.py snipe-at -u "TargetName" -w "5/7/2026 • 6:06:50 PM" --timezone America/New_York --live
+```
+
+Bash:
+
+```bash
+NAMEMC_SNIPER_LIVE_ACK=I_UNDERSTAND_THIS_CHANGES_A_REAL_ACCOUNT \
+python Main.py snipe-at -u "TargetName" -w "5/7/2026 • 6:06:50 PM" --timezone America/New_York --live
+```
+
+Without the flag and acknowledgement, non-local claim APIs are rejected before an HTTP session is created.
+
+## Local integration API
+
+`src.testing.fake_minecraft_api.FakeMinecraftAPI` binds only to `127.0.0.1` and returns scripted statuses such as `400 → 429 → 200`. This exercises serialization, headers, connection pooling, response handling, and cleanup without reaching Minecraft.
+
+## Operational notes
+
+- `max_snipe_attempts` is a global limit shared by all workers.
+- Invalid or ineligible tokens are disabled for the current window.
+- Discord notifications run outside the precision timer and have bounded timeouts.
+- Proxy credentials are redacted from logs.
+- NTP sources are queried concurrently; HTTPS time APIs are fallback sources and use round-trip midpoint correction.
+- A VPS is not required for correctness testing. Its routing and scheduler behavior can later be measured with the non-destructive `benchmark` command.
+
+Use live functionality only where permitted and respect Minecraft service limits and account restrictions.

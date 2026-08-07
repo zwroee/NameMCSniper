@@ -1,0 +1,5 @@
+# Copy this file to tokens.txt and put one Minecraft bearer token per line.
+# Blank lines and lines beginning with # are ignored.
+
+first-account-token
+second-account-token
